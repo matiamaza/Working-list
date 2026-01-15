@@ -1,0 +1,128 @@
+/* --- FUENTES Y COLORES GENERALES --- */
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Roboto', sans-serif;
+    color: #FFFFFF; /* Texto blanco general */
+}
+
+/* Fondo Principal de la Aplicación */
+.stApp {
+    background-color: #050A18; /* Azul marino muy oscuro */
+    background-image: radial-gradient(circle at top center, #0b1430 0%, #050A18 80%);
+}
+
+/* --- BARRA LATERAL (SIDEBAR) --- */
+[data-testid="stSidebar"] {
+    background-color: #081026; /* Un poco más claro que el fondo principal */
+    border-right: 1px solid #1E3A8A; /* Borde azul sutil */
+}
+
+/* Títulos en la barra lateral */
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+    color: #00D4FF !important; /* Cian brillante */
+}
+
+/* Widgets de entrada (Inputs) en modo oscuro */
+.stDateInput input, .stTimeInput input, .stNumberInput input {
+    background-color: #121E3D !important;
+    color: white !important;
+    border: 1px solid #1E3A8A !important;
+    border-radius: 8px !important;
+}
+
+/* File Uploader */
+[data-testid="stFileUploader"] section {
+    background-color: #121E3D !important;
+    border: 1px dashed #00D4FF !important;
+}
+
+/* --- ENCABEZADO PERSONALIZADO (LOGO + TITULO) --- */
+.header-container {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 1rem 0;
+    border-bottom: 2px solid #1E3A8A;
+    margin-bottom: 2rem;
+    background: linear-gradient(90deg, rgba(30,58,138,0.2) 0%, rgba(5,10,24,0) 100%);
+    border-radius: 15px;
+    padding: 20px;
+}
+
+.logo-img {
+    max-height: 80px;
+    margin-right: 25px;
+    /* Opcional: si el logo es oscuro, esto lo vuelve blanco brillante */
+    /* filter: brightness(0) invert(1) drop-shadow(0 0 5px #00D4FF); */
+}
+
+.main-title {
+    font-size: 3rem !important;
+    font-weight: 700 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: -webkit-linear-gradient(0deg, #FFFFFF, #00D4FF);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-shadow: 0px 0px 10px rgba(0, 212, 255, 0.3);
+}
+
+/* --- TARJETAS Y METRICAS (KPIs) --- */
+/* Contenedor de métricas */
+[data-testid="stMetric"] {
+    background-color: #121E3D;
+    padding: 20px;
+    border-radius: 15px;
+    border: 1px solid #1E3A8A;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+    text-align: center;
+    transition: transform 0.2s;
+}
+
+[data-testid="stMetric"]:hover {
+     transform: translateY(-5px);
+     border-color: #00D4FF;
+     box-shadow: 0 4px 20px rgba(0, 212, 255, 0.2);
+}
+
+/* Etiquetas y valores de las métricas */
+[data-testid="stMetricLabel"] {
+    color: #A0AEC0 !important; /* Gris claro */
+    font-size: 1rem !important;
+}
+[data-testid="stMetricValue"] {
+    color: #FFFFFF !important;
+    font-size: 1.8rem !important;
+    font-weight: bold !important;
+}
+
+/* --- SUBTITULOS --- */
+h3 {
+    color: #00D4FF !important;
+    border-left: 4px solid #00D4FF;
+    padding-left: 10px;
+    margin-top: 2rem !important;
+}
+
+/* --- EXPANDER Y DATAFRAME --- */
+.streamlit-expanderHeader {
+    background-color: #121E3D !important;
+    color: white !important;
+    border-radius: 10px !important;
+    border: 1px solid #1E3A8A !important;
+}
+
+/* Ajuste para Dataframes en modo oscuro */
+[data-testid="stDataFrame"] {
+    background-color: #081026;
+    border: 1px solid #1E3A8A;
+    border-radius: 10px;
+    padding: 10px;
+}
+
+/* --- DIVIDER --- */
+hr {
+    border-color: #1E3A8A !important;
+    opacity: 0.5;
+}
