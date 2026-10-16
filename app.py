@@ -6,6 +6,7 @@ import pdfplumber
 import re
 import os
 import io
+import html
 from datetime import datetime, timedelta, time
 
 # --- 1. CONFIGURACIÓN INICIAL Y ESTILOS ---
@@ -42,6 +43,61 @@ BREAKS_CONFIG = [
     (11, 20, 12, 0, "COLACIÓN T1"),
     (18, 50, 19, 30, "COLACIÓN T2")
 ]
+
+PARES_COLORES_GRUAS = [
+    ("#D35400", "#F39C12"),
+    ("#2980B9", "#5DADE2"),
+    ("#27AE60", "#58D68D"),
+    ("#8E44AD", "#AF7AC5"),
+    ("#C0392B", "#E74C3C"),
+]
+GANTT_BG_COLOR = "#1b263b"
+
+def obtener_colores_gruas(lista_gruas):
+    """Asigna el par de colores de descarga/embarque a cada grúa."""
+    return {
+        nombre: PARES_COLORES_GRUAS[indice % len(PARES_COLORES_GRUAS)]
+        for indice, nombre in enumerate(lista_gruas)
+    }
+
+def mostrar_leyenda_grua(nombre_grua, colores, destino=st):
+    """Muestra junto a los controles el color de cada operación de la grúa."""
+    color_descarga, color_embarque = colores
+    nombre_seguro = html.escape(str(nombre_grua))
+    destino.markdown(
+        f"<div style='margin:4px 0 2px;font-size:0.85rem'>"
+        f"<b>{nombre_seguro}</b> &nbsp;"
+        f"<span style='color:{color_descarga}'>■ Descarga</span> &nbsp;"
+        f"<span style='color:{color_embarque}'>■ Embarque</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+def clasificar_zona_tarea(row):
+    """Detecta cubierta/bodega si el PDF o Excel contiene esa indicación textual."""
+    bay = str(row.get('Bay', '')).upper().strip()
+    bay_match = re.search(r"\b\d+\s*([DH])\b", bay)
+    if bay_match:
+        return "Cubierta" if bay_match.group(1) == "D" else "Bodega"
+
+    texto = " ".join(str(valor) for valor in row.values if pd.notna(valor)).upper()
+    if re.search(r"\b(CUBIERTA|DECK|ON\s*DECK|UPPER\s*DECK)\b", texto):
+        return "Cubierta"
+    if re.search(r"\b(BODEGA|HOLD|UNDER\s*DECK)\b", texto):
+        return "Bodega"
+    return "Sin identificar"
+
+def generar_hovertemplates_gantt(bays_reales):
+    templates = []
+    for bay_real in bays_reales:
+        zona = "" if re.search(r"\d+\s*[HD]\s*$", str(bay_real).upper()) else "<br>%{customdata[2]}"
+        templates.append(
+            "<b>%{customdata[0]}</b><br>%{customdata[1]} Movimientos"
+            f"{zona}<br>In: %{{customdata[3]|%H:%M}}"
+            "<br>Out: %{customdata[4]|%H:%M}"
+            "<br>Neto: %{customdata[5]} min<extra></extra>"
+        )
+    return templates
 
 # --- 3. FUNCIONES DEL MÓDULO 1: SIMULADOR ---
 
@@ -207,6 +263,197 @@ def calcular_fin_con_descansos(inicio_dt, duracion_minutos):
             if salto_hasta and salto_hasta > siguiente_corte: cursor = salto_hasta
     return cursor
 
+def _fin_descanso_actual(cursor):
+    """Devuelve el fin del descanso activo en cursor, si existe."""
+    for offset in (-1, 0):
+        dia = cursor.date() + timedelta(days=offset)
+        for h_ini, m_ini, h_fin, m_fin, _ in BREAKS_CONFIG:
+            b_inicio = datetime.combine(dia, time(h_ini, m_ini))
+            b_fin = datetime.combine(dia, time(h_fin, m_fin))
+            if b_fin < b_inicio:
+                b_fin += timedelta(days=1)
+            if b_inicio <= cursor < b_fin:
+                return b_fin
+    return None
+
+def generar_turnos_trabajo(inicio_dt, cantidad=9):
+    """Genera los próximos turnos de 08:00–15:30, 15:30–23:00 y 23:00–06:30."""
+    turnos = []
+    fecha = inicio_dt.date() - timedelta(days=1)
+    while len(turnos) < cantidad:
+        turnos_del_dia = [
+            (datetime.combine(fecha, time(8, 0)), datetime.combine(fecha, time(15, 30))),
+            (datetime.combine(fecha, time(15, 30)), datetime.combine(fecha, time(23, 0))),
+            (datetime.combine(fecha, time(23, 0)), datetime.combine(fecha + timedelta(days=1), time(6, 30))),
+        ]
+        turnos.extend((inicio, fin) for inicio, fin in turnos_del_dia if fin > inicio_dt)
+        fecha += timedelta(days=1)
+    return turnos[:cantidad]
+
+def _gmph_en_hora(cursor, gmph_schedule):
+    """Busca el rendimiento del turno absoluto que contiene cursor."""
+    for inicio, fin, gmph in gmph_schedule:
+        if inicio <= cursor < fin:
+            return float(gmph)
+    return None
+
+def _siguiente_cambio_horario(cursor, gmph_schedule):
+    """Encuentra el próximo fin de turno o inicio de descanso."""
+    candidatos = [fin for inicio, fin, _ in gmph_schedule if fin > cursor]
+    for offset in (-1, 0, 1):
+        dia = cursor.date() + timedelta(days=offset)
+        for h_ini, m_ini, h_fin, m_fin, _ in BREAKS_CONFIG:
+            b_inicio = datetime.combine(dia, time(h_ini, m_ini))
+            b_fin = datetime.combine(dia, time(h_fin, m_fin))
+            if b_fin < b_inicio:
+                b_fin += timedelta(days=1)
+            if b_inicio > cursor:
+                candidatos.append(b_inicio)
+            if b_fin > cursor:
+                candidatos.append(b_fin)
+    return min(candidatos) if candidatos else None
+
+def calcular_intervalo_con_gmph(inicio_dt, movimientos, gmph_schedule):
+    """Calcula inicio efectivo, fin y minutos netos con GMPH por turno."""
+    cursor = inicio_dt
+    movimientos_pendientes = float(movimientos)
+    inicio_efectivo = None
+    minutos_netos = 0.0
+
+    while movimientos_pendientes > 0.000001:
+        fin_descanso = _fin_descanso_actual(cursor)
+        if fin_descanso is not None:
+            cursor = fin_descanso
+            continue
+
+        gmph_actual = _gmph_en_hora(cursor, gmph_schedule)
+        if gmph_actual is None:
+            siguientes_turnos = [
+                inicio for inicio, fin, _ in gmph_schedule if inicio > cursor and fin > cursor
+            ]
+            if not siguientes_turnos:
+                raise ValueError(
+                    "La tarea supera los turnos GMPH configurados para esta grúa. Revise los rendimientos y amplíe los turnos configurados."
+                )
+            cursor = min(siguientes_turnos)
+            continue
+
+        siguiente_cambio = _siguiente_cambio_horario(cursor, gmph_schedule)
+        if siguiente_cambio is None:
+            raise ValueError(
+                "La tarea supera los turnos GMPH configurados para esta grúa. Revise los rendimientos y amplíe los turnos configurados."
+            )
+
+        if inicio_efectivo is None:
+            inicio_efectivo = cursor
+
+        minutos_disponibles = (siguiente_cambio - cursor).total_seconds() / 60
+        minutos_necesarios = movimientos_pendientes * 60 / gmph_actual
+        minutos_trabajados = min(minutos_disponibles, minutos_necesarios)
+        minutos_netos += minutos_trabajados
+        movimientos_pendientes -= minutos_trabajados * gmph_actual / 60
+        cursor += timedelta(minutes=minutos_trabajados)
+
+    return inicio_efectivo, cursor, round(minutos_netos, 1)
+
+def estimar_turnos_necesarios(movimientos, inicio_dt, gmph_promedio=20, max_turnos=9):
+    """Estima los turnos requeridos según la cola y un GMPH promedio de referencia."""
+    if movimientos <= 0:
+        return 1
+
+    turnos = generar_turnos_trabajo(inicio_dt, cantidad=max_turnos)
+    schedule = [(inicio, fin, gmph_promedio) for inicio, fin in turnos]
+    try:
+        _, fin_estimado, _ = calcular_intervalo_con_gmph(
+            inicio_dt, movimientos, schedule
+        )
+    except ValueError:
+        return max_turnos
+
+    for indice, (_, fin_turno) in enumerate(turnos, start=1):
+        if fin_estimado <= fin_turno:
+            return indice
+    return max_turnos
+
+def estimar_movimientos_por_grua(df):
+    """Suma la cola por grúa, interpretando correctamente Total M acumulado."""
+    resultados = {}
+    if df is None or df.empty or 'Grúa' not in df.columns:
+        return resultados
+
+    datos = df.copy()
+    if 'Seq' in datos.columns:
+        datos['Seq'] = pd.to_numeric(datos['Seq'], errors='coerce')
+        datos = datos.sort_values(['Grúa', 'Seq'])
+
+    for nombre_grua, grupo in datos.groupby('Grúa'):
+        total_estimado = 0.0
+        last_total_m = 0.0
+        for _, row in grupo.iterrows():
+            total_acumulado = extraer_numero(row.get('Total M', ''))
+            mov_fila = extraer_numero(row.get('Mov', '')) or 0
+            if total_acumulado is not None:
+                delta = total_acumulado - last_total_m
+                if delta >= 0:
+                    movimientos = delta
+                    last_total_m = total_acumulado
+                else:
+                    movimientos = mov_fila
+                    last_total_m += mov_fila
+            else:
+                movimientos = mov_fila
+                last_total_m += mov_fila
+            total_estimado += max(0, movimientos)
+        resultados[nombre_grua] = total_estimado
+    return resultados
+
+def configurar_gmph_por_grua(
+    nombre_grua, gmph_default, minimo, maximo, clave_gmph, inicio_dt, movimientos_estimados
+):
+    """Muestra el GMPH constante o permite definirlo para cada uno de 9 turnos."""
+    usar_rangos = st.checkbox(
+        "Definir GMPH por turno",
+        value=False,
+        key=f"usar_rangos_gmph_{nombre_grua}"
+    )
+    if not usar_rangos:
+        gmph = st.number_input(
+            "GMPH", float(minimo), float(maximo), float(gmph_default), 0.1, key=clave_gmph
+        )
+        return gmph, None
+
+    turnos_estimados = estimar_turnos_necesarios(
+        movimientos_estimados, inicio_dt, gmph_promedio=20
+    )
+    st.caption(
+        f"Cola estimada: {movimientos_estimados:,.0f} movimientos. "
+        f"A 20 GMPH se proyectan {turnos_estimados} turno(s)."
+    )
+    cantidad_turnos = st.number_input(
+        "Turnos a configurar",
+        min_value=1,
+        max_value=9,
+        value=turnos_estimados,
+        step=1,
+        key=f"cantidad_turnos_{nombre_grua}_{turnos_estimados}",
+        help="El valor inicial se estima con 20 movimientos por hora; se puede ajustar hasta 9.",
+    )
+    st.caption("Cada turno puede tener un GMPH distinto; los descansos siguen excluidos.")
+    turnos = generar_turnos_trabajo(inicio_dt, cantidad=int(cantidad_turnos))
+    columnas = st.columns(3)
+    schedule = []
+    for indice, (inicio_turno, fin_turno) in enumerate(turnos):
+        etiqueta = (
+            f"Turno {indice + 1} · {inicio_turno:%d/%m} "
+            f"{inicio_turno:%H:%M}–{fin_turno:%H:%M}"
+        )
+        gmph_turno = columnas[indice % 3].number_input(
+            etiqueta, float(minimo), float(maximo), float(gmph_default), 0.1,
+            key=f"gmph_turno_{nombre_grua}_{indice + 1}_{inicio_turno:%Y%m%d}"
+        )
+        schedule.append((inicio_turno, fin_turno, gmph_turno))
+    return gmph_default, schedule
+
 def extraer_numero(texto):
     match = re.search(r'(\d+)', str(texto))
     return float(match.group(1)) if match else None
@@ -220,10 +467,12 @@ def calcular_cronograma(df, config_gruas):
     for nombre_grua, grupo_df in df.groupby("Grúa"):
         params = config_gruas.get(nombre_grua, {'inicio': datetime.now(), 'gmph': 20})
         tiempo_actual, gmph = params['inicio'], params.get('gmph', 20)
+        gmph_schedule = params.get('gmph_schedule')
         last_total_m = 0
         
         for index, row in grupo_df.iterrows():
             raw_action, raw_bay = str(row.get('Action Name', '')).upper(), str(row.get('Bay', '')).upper()
+            zona_tarea = clasificar_zona_tarea(row)
             current_total_m = extraer_numero(row.get('Total M', ''))
             movimientos = 0
             
@@ -246,23 +495,111 @@ def calcular_cronograma(df, config_gruas):
                 duracion_minutos, categoria_visual = 15, "Pontón"
                 if bay_visual_num == 0: bay_visual_str = "General" 
             elif movimientos > 0:
-                duracion_minutos = (movimientos / gmph) * 60
-                kws_descarga = ["DISCH", "DSCH", "BLISCH", "DISH", "DDI", "DHI", "SCH", "DCH"]
-                kws_embarque = ["LOAD", "HOAD", "DOAD", "LOD", "LOA", "O AD", " HL", " DL", "AD TWI"]
+                if gmph_schedule:
+                    inicio_tarea, tiempo_fin, duracion_minutos = calcular_intervalo_con_gmph(
+                        tiempo_actual, movimientos, gmph_schedule
+                    )
+                else:
+                    inicio_tarea = tiempo_actual
+                    duracion_minutos = (movimientos / gmph) * 60
+                kws_descarga = ["DISCH", "DSCH", "BLISCH", "DISH", "DDI", "DHI", "SCH", "DCH", "REESTIBA OFF"]
+                kws_embarque = ["LOAD", "HOAD", "DOAD", "LOD", "LOA", "O AD", " HL", " DL", "AD TWI", "REESTIBA ON"]
                 
                 if any(kw in texto_fila for kw in kws_descarga): categoria_visual = f"{nombre_grua} - Descarga"
                 elif any(kw in texto_fila for kw in kws_embarque): categoria_visual = f"{nombre_grua} - Embarque"
 
             if duracion_minutos > 0:
-                tiempo_fin = calcular_fin_con_descansos(tiempo_actual, duracion_minutos)
+                if not gmph_schedule or "PONTOON" in texto_fila or "OPEN" in texto_fila or "CLOSE" in texto_fila:
+                    inicio_tarea = tiempo_actual
+                    tiempo_fin = calcular_fin_con_descansos(tiempo_actual, duracion_minutos)
                 cronograma.append({
                     "Grúa": nombre_grua, "Bay Real": raw_bay, "Bay Visual": bay_visual_str,
                     "Acción": f"{raw_action.replace(chr(10), ' ') or 'Contexto'} ({int(movimientos)})",
-                    "Inicio": tiempo_actual, "Fin": tiempo_fin, "Duración Neta": round(duracion_minutos, 1),
-                    "Categoría Visual": categoria_visual
+                    "Movimientos": int(movimientos),
+                    "Inicio": inicio_tarea, "Fin": tiempo_fin, "Duración Neta": round(duracion_minutos, 1),
+                    "Categoría Visual": categoria_visual, "Zona": zona_tarea
                 })
                 tiempo_actual = tiempo_fin
     return pd.DataFrame(cronograma)
+
+def _tipo_operacion_programa(row):
+    accion = str(row.get("Acción", "")).upper()
+    categoria = str(row.get("Categoría Visual", "")).upper()
+    bay = str(row.get("Bay Real", "")).upper()
+    if "PONT" in categoria or "PONTOON" in accion or "PONTOON" in bay:
+        return "Pontoons"
+    if "REESTIBA" in accion or "RESTOW" in accion:
+        return "Restow"
+    if "DESCARGA" in categoria or any(palabra in accion for palabra in ("DISCH", "DSCH", "DESCARGA")):
+        return "Discharge"
+    if "EMBARQUE" in categoria or any(palabra in accion for palabra in ("LOAD", "EMBARQUE")):
+        return "Load"
+    return None
+
+def construir_programa_trabajo(df_cronograma):
+    operaciones = ["Discharge", "Load", "Restow", "Pontoons"]
+    gruas = list(dict.fromkeys(df_cronograma["Grúa"].astype(str)))
+    gruas.sort(key=lambda grua: (0 if "STS" in grua.upper() else 1 if "MHC" in grua.upper() else 2, grua))
+
+    programa = df_cronograma.copy()
+    programa["Operation"] = programa.apply(_tipo_operacion_programa, axis=1)
+    programa = programa[programa["Operation"].isin(operaciones)].copy()
+    programa["Quantity"] = pd.to_numeric(programa["Movimientos"], errors="coerce").fillna(0)
+    es_ponton = programa["Operation"] == "Pontoons"
+    programa.loc[es_ponton, "Quantity"] = programa.loc[es_ponton, "Quantity"].where(
+        programa.loc[es_ponton, "Quantity"] > 0, 1
+    )
+
+    filas = []
+    for operacion in operaciones:
+        fila = {"Operation": operacion}
+        datos_operacion = programa[programa["Operation"] == operacion]
+        for grua in gruas:
+            cantidad = datos_operacion.loc[datos_operacion["Grúa"] == grua, "Quantity"].sum()
+            fila[grua] = int(cantidad)
+        fila["Total"] = sum(fila[grua] for grua in gruas)
+        filas.append(fila)
+
+    tabla = pd.DataFrame(filas, columns=["Operation", *gruas, "Total"])
+    totales = {"Operation": "Total"}
+    for grua in gruas:
+        totales[grua] = int(tabla[grua].sum())
+    totales["Total"] = int(tabla["Total"].sum())
+    tabla.loc[len(tabla)] = totales
+
+    resumen = {
+        operacion: int(tabla.loc[tabla["Operation"] == operacion, "Total"].iloc[0])
+        for operacion in operaciones
+    }
+    return tabla, resumen
+
+def construir_tabla_turnos_trabajados(df_cronograma):
+    inicios = pd.to_datetime(df_cronograma["Inicio"])
+    fines = pd.to_datetime(df_cronograma["Fin"])
+    inicio_operacion = inicios.min()
+    fin_operacion = fines.max()
+    turnos = [
+        (time(8, 0), time(15, 30)),
+        (time(15, 30), time(23, 0)),
+        (time(23, 0), time(6, 30)),
+    ]
+    filas_turnos = []
+
+    for dia in pd.date_range(inicio_operacion.date() - timedelta(days=1), fin_operacion.date(), freq="D").date:
+        for hora_inicio, hora_fin in turnos:
+            inicio_turno = datetime.combine(dia, hora_inicio)
+            fin_turno = datetime.combine(dia, hora_fin)
+            if fin_turno <= inicio_turno:
+                fin_turno += timedelta(days=1)
+            tareas_turno = (inicios < fin_turno) & (fines > inicio_turno)
+            if tareas_turno.any():
+                cantidad_cuadrillas = df_cronograma.loc[tareas_turno, "Grúa"].astype(str).nunique()
+                filas_turnos.append({
+                    "Gangs shifts": f"TURNO {len(filas_turnos) + 1}",
+                    "Gangs / STS / MHC": f"{cantidad_cuadrillas} Gangs /",
+                })
+
+    return pd.DataFrame(filas_turnos)
 
 # --- 4. FUNCIONES DEL MÓDULO 2: VISUALIZADOR 3D ---
 
@@ -513,19 +850,35 @@ def render_planificador_sts():
             n_gruas = st.number_input("N° Grúas", 1, 4, 2)
             lista_gruas = [f"G{i+1}" for i in range(n_gruas)]
             config_gruas = {}
+            df_asignacion_previa = st.session_state.get("editor_sts")
+            if not isinstance(df_asignacion_previa, pd.DataFrame):
+                df_asignacion_previa = st.session_state.df_resumen_sts
+            movimientos_por_grua = {}
+            if {'Grúa', 'Total_Mov'}.issubset(df_asignacion_previa.columns):
+                asignados_previos = df_asignacion_previa[
+                    df_asignacion_previa['Grúa'].isin(lista_gruas)
+                ]
+                movimientos_por_grua = asignados_previos.groupby('Grúa')['Total_Mov'].sum().to_dict()
+            colores_config_gruas = obtener_colores_gruas(lista_gruas)
             
             for g in lista_gruas:
+                mostrar_leyenda_grua(g, colores_config_gruas[g], destino=c_config)
                 with st.expander(f"Config {g}", expanded=False):
                     # --- NUEVO: Selector de Tipo de Grúa ---
                     tipo_grua = st.selectbox(f"Tipo {g}", ["STS", "MHC"], key=f"tipo_{g}")
                     
-                    gmph = st.number_input(f"GMPH", 20, 40, 25, key=f"gmph_{g}")
                     hora = st.time_input(f"Inicio", time(8,0), key=f"h_{g}")
+                    inicio_grua = datetime.combine(datetime.today(), hora)
+                    gmph, gmph_schedule = configurar_gmph_por_grua(
+                        g, 22, 20, 40, f"gmph_{g}", inicio_grua,
+                        movimientos_por_grua.get(g, 0)
+                    )
                     
                     # Guardamos el tipo en el diccionario de configuración
                     config_gruas[g] = {
-                        "inicio": datetime.combine(datetime.today(), hora), 
+                        "inicio": inicio_grua,
                         "gmph": gmph,
+                        "gmph_schedule": gmph_schedule,
                         "tipo": tipo_grua  # <--- Guardado aquí
                     }
             # Botón de Descarga Excel (Igual que tu script original)
@@ -595,12 +948,7 @@ def render_planificador_sts():
               # --- A. UNIFICACIÓN Y PREPARACIÓN DE DATOS ---
             # 1. Unimos las tablas (Restringido + Standard) si usaste la lógica de listas separadas
             # Si no usaste la lógica separada, df_editado_final es simplemente df_editado
-            try:
-                # Intentamos usar la variable unificada si existe (del paso anterior)
-                df_procesar = df_editado_final 
-            except:
-                # Si no existe, usamos la del editor único
-                df_procesar = df_editado
+            df_procesar = df_editado
 
             asignados = df_procesar[df_procesar['Grúa'] != "Sin Asignar"].sort_values(['Grúa', 'Secuencia'])
             
@@ -633,7 +981,11 @@ def render_planificador_sts():
 
             # --- B. CÁLCULO DE TIEMPOS (Motor Matemático) ---
             # Usamos la misma función que el simulador PDF
-            df_cronograma = calcular_cronograma(df_para_gantt, config_gruas)
+            try:
+                df_cronograma = calcular_cronograma(df_para_gantt, config_gruas)
+            except ValueError as e:
+                st.error(str(e))
+                st.stop()
             
             if df_cronograma.empty:
                 st.error("No se pudo calcular el cronograma. Revisa las asignaciones.")
@@ -654,13 +1006,10 @@ def render_planificador_sts():
                 st.divider()
 
                 # 2. Configuración de Colores (Copia exacta del Simulador)
-                pares_colores = [("#D35400", "#F39C12"), ("#2980B9", "#5DADE2"), ("#27AE60", "#58D68D"), ("#8E44AD", "#AF7AC5"), ("#C0392B", "#E74C3C")]
                 mapa_colores = { "Pontón": "#7F8C8D", "Otro": "#BDC3C7" }
-                
-                # Asignar colores dinámicos según las grúas presentes
                 gruas_activas = sorted(df_cronograma['Grúa'].unique())
-                for i, nombre_g in enumerate(gruas_activas):
-                    color_desc, color_emb = pares_colores[i % len(pares_colores)]
+                colores_por_grua = obtener_colores_gruas(gruas_activas)
+                for nombre_g, (color_desc, color_emb) in colores_por_grua.items():
                     mapa_colores[f"{nombre_g} - Descarga"] = color_desc
                     mapa_colores[f"{nombre_g} - Embarque"] = color_emb
 
@@ -695,23 +1044,33 @@ def render_planificador_sts():
                 for categoria, color in mapa_colores.items():
                     df_cat = df_cronograma[df_cronograma['Categoría Visual'] == categoria]
                     if df_cat.empty: continue
-                    
-                    duracion_ms = (df_cat['Fin'] - df_cat['Inicio']).dt.total_seconds() * 1000
-                    
-                    fig.add_trace(go.Bar(
-                        name=categoria, 
-                        x=df_cat['Bay Visual'], 
-                        y=duracion_ms, 
-                        base=df_cat['Inicio'],
-                        orientation='v', 
-                        marker_color=color, 
-                        marker_line_color='black', 
-                        marker_line_width=1,
-                        opacity=1.0, 
-                        width=0.95,
-                        customdata=df_cat[['Grúa', 'Acción', 'Inicio', 'Fin', 'Duración Neta']],
-                        hovertemplate="<b>Bay %{x}</b><br>%{customdata[1]}<br>In: %{base|%H:%M}<br>Out: %{customdata[3]|%H:%M}<br>Neto: %{customdata[4]} min<extra></extra>"
-                    ))
+                    for zona, df_zona in df_cat.groupby('Zona', dropna=False):
+                        duracion_ms = (df_zona['Fin'] - df_zona['Inicio']).dt.total_seconds() * 1000
+                        es_cubierta = zona == "Cubierta"
+                        patron = {"shape": "/" if es_cubierta else ""}
+                        if es_cubierta:
+                            patron.update({
+                                "fgcolor": color,
+                                "bgcolor": GANTT_BG_COLOR,
+                                "solidity": 0.75,
+                            })
+                        fig.add_trace(go.Bar(
+                            name=categoria,
+                            x=df_zona['Bay Visual'],
+                            y=duracion_ms,
+                            base=df_zona['Inicio'],
+                            orientation='v',
+                            marker=dict(
+                                color=color,
+                                line=dict(color='black', width=1),
+                                pattern=patron,
+                            ),
+                            opacity=1.0,
+                            width=0.95,
+                            customdata=df_zona[['Bay Real', 'Movimientos', 'Zona', 'Inicio', 'Fin', 'Duración Neta']],
+                            hovertemplate=generar_hovertemplates_gantt(df_zona['Bay Real']),
+                            showlegend=not es_cubierta,
+                        ))
 
                 # 4. Dibujar Descansos (Breaks - Franjas Negras)
                 dias_unicos = pd.to_datetime(df_cronograma['Inicio']).dt.date.unique()
@@ -733,7 +1092,8 @@ def render_planificador_sts():
                             fillcolor="rgba(50, 50, 50, 1.0)", 
                             line_width=0, layer="above",
                             annotation_text=label, 
-                            annotation_position="top left", 
+                            annotation_position="inside left",
+                            annotation_y=t_inicio + (t_fin - t_inicio) / 2,
                             annotation_font_color="white", 
                             annotation_font_size=10
                         )
@@ -744,7 +1104,7 @@ def render_planificador_sts():
                     title="Planificación Maestra STS (Visualización Simulador)",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color='white'), bgcolor='rgba(0,0,0,0)'),
                     dragmode='pan', hovermode='closest', barmode='overlay', bargap=0.02,
-                    plot_bgcolor='#1b263b', paper_bgcolor='#1b263b', font=dict(color='white'),
+                    plot_bgcolor=GANTT_BG_COLOR, paper_bgcolor=GANTT_BG_COLOR, font=dict(color='white'),
                     yaxis=dict(
                         type='date', 
                         title="Hora", 
@@ -918,7 +1278,7 @@ def render_simulador():
             df_raw, vessel_name = procesar_excel(uploaded_file)
         if vessel_name: st.info(f"**Buque:** {vessel_name}")
 
-        gmph_default = 25.0
+        gmph_default = 22.0
         excel_path = "Consolidado Naves 2025.xlsx"
         
         try:
@@ -939,15 +1299,32 @@ def render_simulador():
         if df_raw is not None and 'Mov' in df_raw.columns:
             st.sidebar.divider()
             lista_gruas = sorted(df_raw['Grúa'].unique())
+            movimientos_por_grua = estimar_movimientos_por_grua(df_raw)
+            colores_config_gruas = obtener_colores_gruas(lista_gruas)
             for grua in lista_gruas:
+                mostrar_leyenda_grua(
+                    grua, colores_config_gruas[grua], destino=st.sidebar
+                )
                 with st.sidebar.expander(f"⚙️ {grua}", expanded=True):
                     c1, c2 = st.columns(2)
                     d = c1.date_input("Fecha", datetime.today(), key=f"d_{grua}")
                     t = c2.time_input("Hora", time(8,0), key=f"t_{grua}")
-                    gmph_input = st.number_input("GMPH", 1.0, 200.0, float(gmph_default), 0.1, key=f"g_{grua}")
-                    config_gruas[grua] = {"inicio": datetime.combine(d, t), "gmph": gmph_input}
+                    inicio_grua = datetime.combine(d, t)
+                    gmph_input, gmph_schedule = configurar_gmph_por_grua(
+                        grua, gmph_default, 1.0, 200.0, f"g_{grua}", inicio_grua,
+                        movimientos_por_grua.get(grua, 0)
+                    )
+                    config_gruas[grua] = {
+                        "inicio": inicio_grua,
+                        "gmph": gmph_input,
+                        "gmph_schedule": gmph_schedule,
+                    }
 
-            df_cronograma = calcular_cronograma(df_raw, config_gruas)
+            try:
+                df_cronograma = calcular_cronograma(df_raw, config_gruas)
+            except ValueError as e:
+                st.error(str(e))
+                st.stop()
             
             if not df_cronograma.empty:
                 fin_max = df_cronograma['Fin'].max()
@@ -965,11 +1342,17 @@ def render_simulador():
                 with col_titulo: st.subheader("Línea temporal de Working List")
                 with col_intervalo: intervalo_minutos = st.number_input("Grid Tiempo (min)", 10, 120, 60, 15)
                 with col_orden: orden_pref = st.selectbox("Orden de Bays", ["Mayor a Menor", "Menor a Mayor"], index=0)
+                st.caption("En BAY, D = cubierta y H = bodega. Achurado diagonal = cubierta; las barras sólidas son bodega o zona no identificada. Pasa el cursor para ver la zona detectada.")
+                sin_zona = (df_cronograma['Zona'] == "Sin identificar").sum()
+                if sin_zona:
+                    st.warning(
+                        f"{sin_zona} tarea(s) no tienen una zona identificable en el texto extraído. "
+                        "Se muestran sólidas; confirma que el PDF incluya una etiqueta como DECK/CUBIERTA o HOLD/BODEGA."
+                    )
                 
-                pares_colores = [("#D35400", "#F39C12"), ("#2980B9", "#5DADE2"), ("#27AE60", "#58D68D"), ("#8E44AD", "#AF7AC5"), ("#C0392B", "#E74C3C")]
                 mapa_colores = { "Pontón": "#7F8C8D", "Otro": "#BDC3C7" }
-                for i, nombre_g in enumerate(lista_gruas):
-                    color_desc, color_emb = pares_colores[i % len(pares_colores)]
+                colores_por_grua = obtener_colores_gruas(lista_gruas)
+                for nombre_g, (color_desc, color_emb) in colores_por_grua.items():
                     mapa_colores[f"{nombre_g} - Descarga"] = color_desc
                     mapa_colores[f"{nombre_g} - Embarque"] = color_emb
 
@@ -986,14 +1369,30 @@ def render_simulador():
                 for categoria, color in mapa_colores.items():
                     df_cat = df_cronograma[df_cronograma['Categoría Visual'] == categoria]
                     if df_cat.empty: continue
-                    duracion_ms = (df_cat['Fin'] - df_cat['Inicio']).dt.total_seconds() * 1000
-                    fig.add_trace(go.Bar(
-                        name=categoria, x=df_cat['Bay Visual'], y=duracion_ms, base=df_cat['Inicio'],
-                        orientation='v', marker_color=color, marker_line_color='black', marker_line_width=1,
-                        opacity=1.0, width=0.95,
-                        customdata=df_cat[['Grúa', 'Acción', 'Inicio', 'Fin', 'Duración Neta']],
-                        hovertemplate="<b>Bay %{x}</b><br>%{customdata[1]}<br>In: %{base|%H:%M}<br>Out: %{customdata[3]|%H:%M}<br>Neto: %{customdata[4]} min<extra></extra>"
-                    ))
+                    for zona, df_zona in df_cat.groupby('Zona', dropna=False):
+                        duracion_ms = (df_zona['Fin'] - df_zona['Inicio']).dt.total_seconds() * 1000
+                        es_cubierta = zona == "Cubierta"
+                        patron = {"shape": "/" if es_cubierta else ""}
+                        if es_cubierta:
+                            patron.update({
+                                "fgcolor": color,
+                                "bgcolor": GANTT_BG_COLOR,
+                                "solidity": 0.90,
+                            })
+                        fig.add_trace(go.Bar(
+                            name=categoria,
+                            x=df_zona['Bay Visual'], y=duracion_ms, base=df_zona['Inicio'],
+                            orientation='v',
+                            marker=dict(
+                                color=color,
+                                line=dict(color='black', width=1),
+                                pattern=patron,
+                            ),
+                            opacity=1.0, width=0.95,
+                            customdata=df_zona[['Bay Real', 'Movimientos', 'Zona', 'Inicio', 'Fin', 'Duración Neta']],
+                            hovertemplate=generar_hovertemplates_gantt(df_zona['Bay Real']),
+                            showlegend=not es_cubierta,
+                        ))
 
                 dias_unicos = pd.to_datetime(df_cronograma['Inicio']).dt.date.unique()
                 if not df_cronograma.empty:
@@ -1008,13 +1407,24 @@ def render_simulador():
                         t_fin = datetime.combine(dia, time(h_fin, m_fin))
                         fig.add_hrect(
                             y0=t_inicio, y1=t_fin, fillcolor="rgba(50, 50, 50, 1.0)", line_width=0, layer="above",
-                            annotation_text=label, annotation_position="top left", annotation_font_color="white", annotation_font_size=10
+                            annotation_text=label, annotation_position="inside left",
+                            annotation_y=t_inicio + (t_fin - t_inicio) / 2,
+                            annotation_font_color="white", annotation_font_size=10
+                        )
+
+                for dia in pd.date_range(range_y_start.date(), range_y_end.date(), freq="D").date:
+                    for hora_hito in (time(6, 30), time(8, 0), time(15, 30), time(23, 0)):
+                        fig.add_hline(
+                            y=datetime.combine(dia, hora_hito),
+                            line_color="white",
+                            line_dash="solid",
+                            line_width=1.5,
                         )
 
                 fig.update_layout(
                     height=900, legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="right", x=1, font=dict(color='white'), bgcolor='rgba(0,0,0,0)'),
                     dragmode='pan', hovermode='closest', barmode='overlay', bargap=0.02,
-                    plot_bgcolor='#1b263b', paper_bgcolor='#1b263b', font=dict(color='white'),
+                    plot_bgcolor=GANTT_BG_COLOR, paper_bgcolor=GANTT_BG_COLOR, font=dict(color='white'),
                     yaxis=dict(type='date', title="Hora", tickformat="%H:%M", tickfont=dict(color='white'), dtick=intervalo_minutos*60*1000, autorange="reversed", range=[range_y_start, range_y_end], gridcolor='#3a506b'),
                     xaxis=dict(title="Bay (Serie Par)", type='category', categoryorder='array', categoryarray=lista_ordenada, side="top", tickfont=dict(color='white'), gridcolor='#000000', fixedrange=True),
                     margin=dict(l=60, r=20, t=120, b=20)
@@ -1022,9 +1432,114 @@ def render_simulador():
                 
                 config_zoom = {'scrollZoom': True, 'displayModeBar': True, 'modeBarButtonsToRemove': ['select2d', 'lasso2d']}
                 st.plotly_chart(fig, use_container_width=True, config=config_zoom)
-                
-                with st.expander("Ver detalle"):
-                    st.dataframe(df_cronograma)
+
+                st.subheader("TENTATIVE WORKING PROGRAM")
+                tabla_programa, resumen_programa = construir_programa_trabajo(df_cronograma)
+                nombre_buque = vessel_name or os.path.splitext(uploaded_file.name)[0]
+                clave_programa = f"{uploaded_file.name}_{abs(hash(uploaded_file.getvalue()))}"
+                encabezado_programa = pd.DataFrame([{
+                    "Vessel name": nombre_buque,
+                    "Service": "",
+                    "Discharge": resumen_programa["Discharge"],
+                    "Loading": resumen_programa["Load"],
+                    "Restow": resumen_programa["Restow"],
+                    "Pontoons": resumen_programa["Pontoons"],
+                }])
+                st.data_editor(
+                    encabezado_programa,
+                    column_config={
+                        "Vessel name": st.column_config.TextColumn("Vessel name"),
+                        "Service": st.column_config.TextColumn("Service"),
+                        **{
+                            campo: st.column_config.NumberColumn(campo, min_value=0, step=1)
+                            for campo in ("Discharge", "Loading", "Restow", "Pontoons")
+                        },
+                    },
+                    hide_index=True,
+                    num_rows="fixed",
+                    width="stretch",
+                    key=f"programa_encabezado_{clave_programa}",
+                )
+
+                gruas_originales = list(tabla_programa.columns[1:-1])
+                numeros_grua = pd.DataFrame({
+                    "Crane": gruas_originales,
+                    "Number": [
+                        (re.search(r"\d+", grua).group(0) if re.search(r"\d+", grua) else grua)
+                        for grua in gruas_originales
+                    ],
+                })
+                numeros_grua = st.data_editor(
+                    numeros_grua,
+                    column_config={
+                        "Crane": st.column_config.TextColumn("Crane", disabled=True),
+                        "Number": st.column_config.TextColumn("Crane number"),
+                    },
+                    hide_index=True,
+                    num_rows="fixed",
+                    width="stretch",
+                    key=f"programa_numeros_grua_{clave_programa}",
+                )
+                nombres_gruas = {}
+                numeros_usados = set()
+                for grua, numero in zip(gruas_originales, numeros_grua["Number"]):
+                    numero = str(numero).strip() or grua
+                    if numero in numeros_usados:
+                        numero = f"{numero} ({grua})"
+                    numeros_usados.add(numero)
+                    nombres_gruas[grua] = numero
+                tabla_programa = tabla_programa.rename(columns=nombres_gruas)
+
+                columnas_programa = {
+                    "Operation": st.column_config.TextColumn("Operation"),
+                    **{
+                        grua: st.column_config.NumberColumn(grua, min_value=0, step=1)
+                        for grua in [*tabla_programa.columns[1:-1], "Total"]
+                    },
+                }
+                st.data_editor(
+                    tabla_programa,
+                    column_config=columnas_programa,
+                    hide_index=True,
+                    num_rows="fixed",
+                    width="stretch",
+                    key=f"programa_gruas_{clave_programa}",
+                )
+
+                tabla_turnos = construir_tabla_turnos_trabajados(df_cronograma)
+                cantidad_turnos = len(tabla_turnos)
+                col_turnos, col_gangs = st.columns([1, 3])
+                with col_turnos:
+                    st.data_editor(
+                        pd.DataFrame({"Working Shifts": [cantidad_turnos]}),
+                        column_config={
+                            "Working Shifts": st.column_config.NumberColumn(
+                                "Working Shifts", min_value=0, step=1
+                            )
+                        },
+                        hide_index=True,
+                        num_rows="fixed",
+                        width="stretch",
+                        key=f"programa_turnos_{clave_programa}",
+                    )
+                with col_gangs:
+                    st.data_editor(
+                        tabla_turnos,
+                        column_config={
+                            "Gangs shifts": st.column_config.TextColumn("Gangs shifts"),
+                            "Gangs / STS / MHC": st.column_config.TextColumn("Gangs / STS / MHC"),
+                        },
+                        hide_index=True,
+                        num_rows="dynamic",
+                        width="stretch",
+                        key=f"programa_gangs_{clave_programa}",
+                    )
+
+                st.text_input(
+                    "ETC",
+                    value=f"ETC {fin_max:%d/%m %H:%M} HRS TBC WP.",
+                    key=f"programa_etc_{clave_programa}",
+                )
             else: st.warning("No hay datos calculados.")
         else: st.error("Error al procesar PDF.")
     else: st.info("Sube el PDF en el panel lateral.")
