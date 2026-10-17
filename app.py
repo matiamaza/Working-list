@@ -52,6 +52,15 @@ PARES_COLORES_GRUAS = [
     ("#C0392B", "#E74C3C"),
 ]
 GANTT_BG_COLOR = "#1b263b"
+NOMBRES_GRUA = ["STS 1", "STS 2", "G5", "G6", "G9", "G10"]
+
+def tipo_grua(nombre):
+    texto = str(nombre).upper().strip()
+    if "STS" in texto:
+        return "STS"
+    if "MHC" in texto or re.fullmatch(r"G\s*\d+", texto):
+        return "MHC"
+    return "Otra"
 
 def obtener_colores_gruas(lista_gruas):
     """Asigna el par de colores de descarga/embarque a cada grúa."""
@@ -539,7 +548,7 @@ def _tipo_operacion_programa(row):
 def construir_programa_trabajo(df_cronograma):
     operaciones = ["Discharge", "Load", "Restow", "Pontoons"]
     gruas = list(dict.fromkeys(df_cronograma["Grúa"].astype(str)))
-    gruas.sort(key=lambda grua: (0 if "STS" in grua.upper() else 1 if "MHC" in grua.upper() else 2, grua))
+    gruas.sort(key=lambda grua: ({"STS": 0, "MHC": 1}.get(tipo_grua(grua), 2), grua))
 
     programa = df_cronograma.copy()
     programa["Operation"] = programa.apply(_tipo_operacion_programa, axis=1)
@@ -573,7 +582,7 @@ def construir_programa_trabajo(df_cronograma):
     }
     return tabla, resumen
 
-def construir_tabla_turnos_trabajados(df_cronograma):
+def calcular_turnos_con_gruas(df_cronograma):
     inicios = pd.to_datetime(df_cronograma["Inicio"])
     fines = pd.to_datetime(df_cronograma["Fin"])
     inicio_operacion = inicios.min()
@@ -593,13 +602,148 @@ def construir_tabla_turnos_trabajados(df_cronograma):
                 fin_turno += timedelta(days=1)
             tareas_turno = (inicios < fin_turno) & (fines > inicio_turno)
             if tareas_turno.any():
-                cantidad_cuadrillas = df_cronograma.loc[tareas_turno, "Grúa"].astype(str).nunique()
+                tipos = pd.Series(
+                    df_cronograma.loc[tareas_turno, "Grúa"].astype(str).unique()
+                ).map(tipo_grua).value_counts()
                 filas_turnos.append({
-                    "Gangs shifts": f"TURNO {len(filas_turnos) + 1}",
-                    "Gangs / STS / MHC": f"{cantidad_cuadrillas} Gangs /",
+                    "turno": len(filas_turnos) + 1,
+                    "STS": int(tipos.get("STS", 0)),
+                    "MHC": int(tipos.get("MHC", 0)),
+                    "Otra": int(tipos.get("Otra", 0)),
                 })
 
-    return pd.DataFrame(filas_turnos)
+    return filas_turnos
+
+def descripcion_cuadrillas(fila):
+    partes = [f"{fila[t]} {t if t != 'Otra' else 'otra(s)'}" for t in ("STS", "MHC", "Otra") if fila[t]]
+    detalle = partes[0] if len(partes) == 1 else ", ".join(partes[:-1]) + " y " + partes[-1] if partes else ""
+    total = fila["STS"] + fila["MHC"] + fila["Otra"]
+    return f"{total} cuadrilla{'s' if total != 1 else ''}: {detalle}"
+
+def construir_tabla_turnos_trabajados(df_cronograma):
+    return pd.DataFrame([
+        {"Gangs shifts": f"TURNO {f['turno']}", "Gangs / STS / MHC": descripcion_cuadrillas(f)}
+        for f in calcular_turnos_con_gruas(df_cronograma)
+    ])
+
+def generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque, alias_gruas=None):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.barcharts import VerticalBarChart
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    azul, gris = colors.HexColor("#1F3A5F"), colors.HexColor("#F2F4F7")
+    est_titulo = ParagraphStyle("t", fontSize=18, leading=22, textColor=azul, fontName="Helvetica-Bold")
+    est_sub = ParagraphStyle("s", fontSize=11, leading=14, textColor=colors.HexColor("#444444"))
+    est_sec = ParagraphStyle("h", fontSize=11, leading=14, textColor=colors.white, fontName="Helvetica-Bold",
+                             backColor=azul, borderPadding=(3, 4, 3, 4))
+
+    inicio = pd.to_datetime(df_cronograma["Inicio"]).min()
+    fin = pd.to_datetime(df_cronograma["Fin"]).max()
+    horas = max((fin - inicio).total_seconds() / 3600, 1e-9)
+    horas_grua = (pd.to_datetime(df_cronograma["Fin"]) - pd.to_datetime(df_cronograma["Inicio"])).dt.total_seconds().sum() / 3600
+
+    gruas = list(tabla_programa.columns[1:-1])
+    fila = lambda op: tabla_programa[tabla_programa["Operation"] == op].iloc[0]
+    desc, emb, tot = fila("Discharge"), fila("Load"), fila("Total")
+    total_movs = int(tot["Total"])
+
+    def kpi(titulo, valor):
+        t = Table([[titulo], [valor]], colWidths=[3.3 * cm], rowHeights=[0.7 * cm, 1.1 * cm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), gris), ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.grey), ("FONTSIZE", (0, 1), (-1, 1), 16),
+            ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"), ("TEXTCOLOR", (0, 1), (-1, 1), azul),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+        ]))
+        return t
+
+    def fila_kpi(items):
+        t = Table([[kpi(a, b) for a, b in items]], hAlign="LEFT")
+        t.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2)]))
+        return t
+
+    elementos = [
+        Paragraph("REPORTE EJECUTIVO DE PLANIFICACIÓN", est_titulo),
+        Paragraph(f"M/N {html.escape(str(nombre_buque).upper())}", est_sub),
+        Paragraph(f"Fecha de operación: {inicio:%d/%m/%Y}", est_sub),
+        Spacer(1, 0.5 * cm),
+        Paragraph("MOVIMIENTOS", est_sec), Spacer(1, 0.2 * cm),
+        fila_kpi([("MOVIMIENTOS TOTALES", f"{total_movs:,}"), ("DESCARGA", f"{int(desc['Total']):,}"),
+                  ("EMBARQUE", f"{int(emb['Total']):,}"), ("GRÚAS", str(len(gruas)))]),
+        Spacer(1, 0.5 * cm),
+        Paragraph("VENTANA OPERACIONAL", est_sec), Spacer(1, 0.2 * cm),
+        fila_kpi([("INICIO", f"{inicio:%d/%m %H:%M}"), ("TÉRMINO EST.", f"{fin:%d/%m %H:%M}"),
+                  ("DURACIÓN", f"{horas:.1f} h"), ("PRODUCTIVIDAD", f"{total_movs / horas:.0f} mov/h"),
+                  ("CRANE DENSITY", f"{horas_grua / horas:.2f}")]),
+        Spacer(1, 0.5 * cm),
+        Paragraph("DISTRIBUCIÓN POR GRÚA", est_sec), Spacer(1, 0.2 * cm),
+    ]
+
+    filas = [["Grúa", "Tipo", "Bahías", "Descarga", "Embarque", "Total", "Participación"]]
+    for g in gruas:
+        original = (alias_gruas or {}).get(g, g)
+        bays = pd.to_numeric(
+            df_cronograma.loc[df_cronograma["Grúa"].astype(str).eq(str(original)), "Bay Visual"], errors="coerce"
+        ).dropna()
+        rango = f"{int(bays.min()):02d}-{int(bays.max()):02d}" if not bays.empty else "-"
+        total_g = int(tot[g])
+        filas.append([g, tipo_grua(original), rango, int(desc[g]), int(emb[g]), total_g,
+                      f"{(total_g / total_movs * 100) if total_movs else 0:.1f}%"])
+    filas.append(["TOTAL", "", "", int(desc["Total"]), int(emb["Total"]), total_movs, "100.0%"])
+
+    tabla = Table(filas, repeatRows=1, colWidths=[2.6 * cm, 1.8 * cm, 2.6 * cm, 2.4 * cm, 2.4 * cm, 2.2 * cm, 3 * cm])
+    tabla.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), azul), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, -1), (-1, -1), gris), ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, gris]),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("FONTSIZE", (0, 0), (-1, -1), 9),
+    ]))
+    elementos += [tabla, Spacer(1, 0.6 * cm), Paragraph("PARTICIPACIÓN POR GRÚA (MOVIMIENTOS)", est_sec),
+                  Spacer(1, 0.2 * cm)]
+
+    dibujo = Drawing(16 * cm, 7 * cm)
+    grafico = VerticalBarChart()
+    grafico.x, grafico.y, grafico.width, grafico.height = 40, 30, 16 * cm - 60, 7 * cm - 50
+    grafico.data = [[int(desc[g]) for g in gruas], [int(emb[g]) for g in gruas]]
+    grafico.categoryAxis.categoryNames = [str(g) for g in gruas]
+    grafico.bars[0].fillColor, grafico.bars[1].fillColor = azul, colors.HexColor("#E08A1E")
+    grafico.valueAxis.valueMin = 0
+    grafico.categoryAxis.labels.fontSize = grafico.valueAxis.labels.fontSize = 8
+    dibujo.add(grafico)
+    elementos += [dibujo, Paragraph("Azul: descarga | Naranja: embarque", est_sub), Spacer(1, 0.5 * cm),
+                  Paragraph("CUADRILLAS POR TURNO DE TRABAJO", est_sec), Spacer(1, 0.2 * cm)]
+
+    filas_turnos = [["Turno", "Cuadrillas", "STS", "MHC", "Detalle"]]
+    for f in calcular_turnos_con_gruas(df_cronograma):
+        filas_turnos.append([f"Turno {f['turno']}", f["STS"] + f["MHC"] + f["Otra"], f["STS"], f["MHC"],
+                             descripcion_cuadrillas(f)])
+    tabla_turnos = Table(filas_turnos, repeatRows=1, colWidths=[2.4 * cm, 2.4 * cm, 1.8 * cm, 1.8 * cm, 8.6 * cm])
+    tabla_turnos.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), azul), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("ALIGN", (1, 0), (3, -1), "CENTER"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, gris]),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("FONTSIZE", (0, 0), (-1, -1), 9),
+    ]))
+    elementos.append(tabla_turnos)
+
+    def pie(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(2 * cm, 1.2 * cm, f"M/N {nombre_buque} - Planificación de nave")
+        canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Página {doc.page}")
+        canvas.restoreState()
+
+    buffer = io.BytesIO()
+    SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm,
+                      topMargin=2 * cm, bottomMargin=2 * cm).build(elementos, onFirstPage=pie, onLaterPages=pie)
+    return buffer.getvalue()
 
 # --- 4. FUNCIONES DEL MÓDULO 2: VISUALIZADOR 3D ---
 
@@ -1263,6 +1407,158 @@ def render_menu():
         st.markdown('<div class="card"><h3>📊 Visualización Operación</h3><p>Descarga, Carga y Reglas One Sphere</p></div>', unsafe_allow_html=True)
         if st.button("Ir a Operaciones", key="b3", use_container_width=True): navigate_to('operacion')
 
+def mostrar_tabla_ejecutiva(df, resaltar_ultima=False):
+    """Renderiza un DataFrame como tabla HTML de estilo ejecutivo (solo lectura)."""
+    encabezados = "".join(
+        f"<th class='{'num' if pd.api.types.is_numeric_dtype(df[c]) else ''}'>{html.escape(str(c))}</th>"
+        for c in df.columns
+    )
+    filas = []
+    for i, (_, fila) in enumerate(df.iterrows()):
+        clase = "total" if resaltar_ultima and i == len(df) - 1 else ""
+        celdas = "".join(
+            f"<td class='{'num' if pd.api.types.is_number(v) else ''}'>"
+            f"{html.escape(str(v))}</td>" for v in fila
+        )
+        filas.append(f"<tr class='{clase}'>{celdas}</tr>")
+    st.markdown(
+        """<style>
+        table.tbl-exec{width:100%;border-collapse:collapse;margin:10px 0 22px;font-size:0.92rem;
+            font-family:'Roboto',sans-serif}
+        table.tbl-exec th{background:transparent;color:#9FB3D1;text-align:left;padding:10px 14px;
+            font-weight:500;letter-spacing:.12em;text-transform:uppercase;font-size:0.7rem;
+            border-bottom:2px solid #C9A227}
+        table.tbl-exec td{padding:11px 14px;border-bottom:1px solid rgba(159,179,209,.18);color:#E6EDF7;
+            background:transparent}
+        table.tbl-exec tbody tr:hover td{background:rgba(201,162,39,.07)}
+        table.tbl-exec td.num{text-align:right;font-variant-numeric:tabular-nums}
+        table.tbl-exec th.num{text-align:right}
+        table.tbl-exec tr.total td{color:#C9A227;font-weight:700;border-top:1px solid #C9A227;
+            border-bottom:none;background:rgba(201,162,39,.06)}
+        .etc-banner{display:flex;flex-direction:column;gap:4px;margin:6px 0 20px;padding:16px 22px;
+            border-left:4px solid #C9A227;background:linear-gradient(90deg,rgba(201,162,39,.12),rgba(0,0,0,0));
+            border-radius:0 8px 8px 0}
+        .etc-banner span{color:#9FB3D1;letter-spacing:.14em;font-size:0.68rem}
+        .etc-banner b{color:#fff;font-size:1.3rem;letter-spacing:.03em;font-weight:500}
+        </style>"""
+        f"<table class='tbl-exec'><thead><tr>{encabezados}</tr></thead><tbody>{''.join(filas)}</tbody></table>",
+        unsafe_allow_html=True,
+    )
+
+ALTO_PLOT_GANTT = 540
+SLOT_PUENTE, SLOT_CHIMENEA = " ", "  "
+
+def svg_buque(categorias, estribor_muelle):
+    """Buque ilustrado con volumen (SVG, vista lateral) con una pila por columna de bay."""
+    from math import pi, sin
+    ancho, cubierta, fondo, flotacion, y_top, alto = 1000, 180, 222, 208, 40, 186
+    n = len(categorias)
+    cw = ancho / n
+    hw = cw * 0.46
+    X = (lambda x: x) if estribor_muelle else (lambda x: ancho - x)
+    deriva = -1 if estribor_muelle else 1
+    ch, dx, dy = 11, 5, 4
+
+    ruta = (f"M{X(0)},{cubierta} L{X(ancho)},{cubierta} Q{X(ancho - 5)},{cubierta + 26} {X(ancho - 52)},{fondo} "
+            f"L{X(16)},{fondo} L{X(0)},{cubierta + 6} Z")
+    s = [f"""<defs>
+<linearGradient id="hull" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#31507F"/><stop offset=".5" stop-color="#16294A"/><stop offset="1" stop-color="#070D1A"/></linearGradient>
+<linearGradient id="white" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#D8E0EA"/></linearGradient>
+<linearGradient id="glass" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9ED8FF"/><stop offset="1" stop-color="#3C8FD6"/></linearGradient>
+<linearGradient id="fun" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#E24B3D"/><stop offset="1" stop-color="#A52A20"/></linearGradient>
+<clipPath id="hc"><path d="{ruta}"/></clipPath>
+<filter id="blur"><feGaussianBlur stdDeviation="3"/></filter></defs>"""]
+
+    # Casco sin ojos de buey: obra viva roja, cinta blanca y borde de cubierta
+    s.append(f'<path d="{ruta}" fill="url(#hull)"/><g clip-path="url(#hc)">'
+             f'<rect x="0" y="{flotacion}" width="{ancho}" height="30" fill="#A82D2D"/>'
+             f'<rect x="0" y="{flotacion - 3}" width="{ancho}" height="3" fill="#F4F6F8"/>'
+             f'<rect x="0" y="{cubierta}" width="{ancho}" height="3" fill="#C9D6EA"/>'
+             f'<rect x="0" y="{cubierta + 3}" width="{ancho}" height="8" fill="#fff" opacity=".06"/></g>'
+             f'<path d="{ruta}" fill="none" stroke="#9FB3D1" stroke-width="1" opacity=".6"/>'
+             f'<polygon points="{X(ancho - 62)},{cubierta} {X(ancho - 62)},{cubierta - 16} {X(ancho - 14)},{cubierta - 16} '
+             f'{X(ancho)},{cubierta - 8} {X(ancho)},{cubierta}" fill="#22385E" stroke="#9FB3D1"/>'
+             f'<circle cx="{X(ancho - 24)}" cy="{cubierta + 14}" r="5" fill="#0A1222" stroke="#9FB3D1"/>')
+
+    # Contenedores: dos colores con cara superior y lateral
+    carga = [i for i, c in enumerate(categorias) if c not in (SLOT_PUENTE, SLOT_CHIMENEA)]
+    sw = cw * 0.80
+    for k, i in enumerate(carga):
+        cx = (i + 0.5) * cw
+        x0, x1 = cx - sw / 2, cx + sw / 2
+        for t in range(2 + int(round(2.2 * sin(pi * (k + 0.5) / len(carga))))):
+            y = cubierta - (t + 1) * ch
+            frente, lado, tapa = (("#2D7FC1", "#1F5F99", "#6FB4E8") if (k + t) % 2 == 0
+                                  else ("#E8743B", "#BF5624", "#F6A877"))
+            s.append(f'<rect x="{x0:.1f}" y="{y}" width="{sw:.1f}" height="{ch - 1}" fill="{frente}" stroke="#0b1220" stroke-width=".8"/>'
+                     f'<polygon points="{x0:.1f},{y} {x0 + dx:.1f},{y - dy} {x1 + dx:.1f},{y - dy} {x1:.1f},{y}" fill="{tapa}" stroke="#0b1220" stroke-width=".6"/>'
+                     f'<polygon points="{x1:.1f},{y} {x1 + dx:.1f},{y - dy} {x1 + dx:.1f},{y + ch - 1 - dy} {x1:.1f},{y + ch - 1}" fill="{lado}" stroke="#0b1220" stroke-width=".6"/>')
+
+    for i, categoria in enumerate(categorias):
+        cx = (i + 0.5) * cw
+        if categoria == SLOT_PUENTE:
+            # Puente en T: torre delgada de alojamiento y cubierta de mando ancha arriba
+            ht = hw * 0.40
+            for d in range(5):
+                y = cubierta - (d + 1) * 11
+                s.append(f'<rect x="{cx - ht:.1f}" y="{y}" width="{2 * ht:.1f}" height="11" fill="url(#white)" stroke="#8FA0B8" stroke-width=".8"/>'
+                         f'<polygon points="{cx + ht:.1f},{y} {cx + ht + 5:.1f},{y - 4} {cx + ht + 5:.1f},{y + 7} {cx + ht:.1f},{y + 11}" fill="#B9C4D3" stroke="#8FA0B8" stroke-width=".6"/>')
+                for k in (-1, 1):
+                    s.append(f'<rect x="{cx + k * ht * 0.5 - ht * 0.22:.1f}" y="{y + 4}" width="{ht * 0.44:.1f}" height="4" fill="#FFD36B"/>')
+            y0 = cubierta - 55
+            s.append(f'<rect x="{cx - hw * 0.95:.1f}" y="{y0 - 4}" width="{hw * 1.9:.1f}" height="4" rx="1" fill="#4B5C74"/>'
+                     f'<polygon points="{cx - hw * 0.9:.1f},{y0 - 4} {cx + hw * 0.9:.1f},{y0 - 4} {cx + hw:.1f},{y0 - 18} {cx - hw:.1f},{y0 - 18}" fill="#0F2038" stroke="#9FB3D1" stroke-width=".8"/>'
+                     f'<polygon points="{cx - hw * 0.85:.1f},{y0 - 7} {cx + hw * 0.85:.1f},{y0 - 7} {cx + hw * 0.94:.1f},{y0 - 15} {cx - hw * 0.94:.1f},{y0 - 15}" fill="url(#glass)"/>'
+                     f'<rect x="{cx - hw * 1.02:.1f}" y="{y0 - 21}" width="{hw * 2.04:.1f}" height="3" rx="1" fill="#E7ECF3"/>'
+                     f'<line x1="{cx}" y1="{y0 - 21}" x2="{cx}" y2="{y0 - 46}" stroke="#DDE3EA" stroke-width="1.6"/>'
+                     f'<rect x="{cx - hw * 0.5:.1f}" y="{y0 - 36}" width="{hw:.1f}" height="2" fill="#DDE3EA"/>'
+                     f'<ellipse cx="{cx}" cy="{y0 - 50}" rx="{hw * 0.26:.1f}" ry="5" fill="#F4F6F8" stroke="#9FB3D1"/>')
+        elif categoria == SLOT_CHIMENEA:
+            tope = cubierta - 78
+            s.append(f'<rect x="{cx - hw * 0.9:.1f}" y="{cubierta - 20}" width="{hw * 1.8:.1f}" height="20" fill="url(#white)" stroke="#9FB3D1" stroke-width=".8"/>'
+                     f'<polygon points="{cx - hw * 0.8:.1f},{cubierta - 20} {cx + hw * 0.8:.1f},{cubierta - 20} {cx + hw * 0.5:.1f},{tope + 6} {cx - hw * 0.5:.1f},{tope}" fill="url(#fun)" stroke="#6E1D16" stroke-width=".8"/>'
+                     f'<polygon points="{cx - hw * 0.66:.1f},{cubierta - 46} {cx + hw * 0.66:.1f},{cubierta - 46} {cx + hw * 0.6:.1f},{cubierta - 56} {cx - hw * 0.6:.1f},{cubierta - 56}" fill="#F4F6F8"/>'
+                     f'<circle cx="{cx}" cy="{cubierta - 51}" r="{min(hw * 0.22, 5):.1f}" fill="#12263F"/>'
+                     f'<polygon points="{cx - hw * 0.5:.1f},{tope} {cx + hw * 0.5:.1f},{tope + 6} {cx + hw * 0.5:.1f},{tope + 14} {cx - hw * 0.5:.1f},{tope + 8}" fill="#0B1220"/>')
+            for k in range(4):
+                s.append(f'<ellipse cx="{cx + deriva * (k + 1) * hw * 0.5:.1f}" cy="{tope - 6 - k * 9}" rx="{hw * (0.3 + 0.12 * k):.1f}" ry="{6 + k * 3}" fill="#CBD5E1" opacity="{0.42 - 0.09 * k:.2f}" filter="url(#blur)"/>')
+
+    ola = f"M0,{flotacion + 6}"
+    for k in range(40):
+        ola += f" Q{(k + 0.5) * ancho / 40:.1f},{flotacion + 6 + (3 if k % 2 == 0 else -3)} {(k + 1) * ancho / 40:.1f},{flotacion + 6}"
+    s.append(f'<path d="{ola}" fill="none" stroke="#4FC3F7" stroke-opacity=".85" stroke-width="2"/>')
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 {y_top} {ancho} {alto}" '
+            f'preserveAspectRatio="none">{"".join(s)}</svg>')
+
+def agregar_buque_al_grafico(fig, lista_ordenada, estribor_muelle, alto_plot=ALTO_PLOT_GANTT):
+    """Dibuja el buque sobre el eje de bays; puente y chimenea ocupan su propia columna y bajan como barra gris."""
+    import base64
+    n = len(lista_ordenada)
+    px = lambda v: 1 + v / alto_plot
+    alto_img = 186
+    fuente = "data:image/svg+xml;base64," + base64.b64encode(svg_buque(lista_ordenada, estribor_muelle).encode()).decode()
+    fig.add_layout_image(source=fuente, xref="paper", yref="paper", x=0, y=px(36 + alto_img),
+                         sizex=1, sizey=alto_img / alto_plot, xanchor="left", yanchor="top",
+                         sizing="stretch", layer="above")
+
+    if estribor_muelle:
+        proa_x, popa_x, proa_ha, popa_ha = 0.93, 0.015, "right", "left"
+    else:
+        proa_x, popa_x, proa_ha, popa_ha = 0.07, 0.985, "left", "right"
+    for texto, x, ha in (("PROA", proa_x, proa_ha), ("POPA", popa_x, popa_ha)):
+        fig.add_annotation(text=texto, x=x, y=px(61), xref="paper", yref="paper", showarrow=False,
+                           xanchor=ha, font=dict(color="#C9D6EA", size=10))
+
+    for slot, texto, alto_marca in ((SLOT_PUENTE, "PUENTE", 214), (SLOT_CHIMENEA, "CHIMENEA", 228)):
+        if slot not in lista_ordenada:
+            continue
+        c = (lista_ordenada.index(slot) + 0.5) / n
+        fig.add_annotation(text=texto, x=c, y=px(alto_marca), xref="paper", yref="paper", showarrow=False,
+                           xanchor="center", font=dict(color="white", size=10))
+        fig.add_shape(type="rect", xref="paper", yref="paper", x0=c - 0.46 / n, x1=c + 0.46 / n, y0=px(40), y1=0,
+                      fillcolor="rgba(160,160,160,0.35)", line=dict(color="rgba(190,190,190,0.7)", width=1),
+                      layer="above")
+
 def render_simulador():
     st.title("🏗️ Simulador de Planificación Naviera - SVTI")
     
@@ -1301,11 +1597,17 @@ def render_simulador():
             lista_gruas = sorted(df_raw['Grúa'].unique())
             movimientos_por_grua = estimar_movimientos_por_grua(df_raw)
             colores_config_gruas = obtener_colores_gruas(lista_gruas)
+            renombres = {}
             for grua in lista_gruas:
-                mostrar_leyenda_grua(
-                    grua, colores_config_gruas[grua], destino=st.sidebar
+                nombre_sel = st.sidebar.selectbox(
+                    f"Nombre de la grúa {grua}", [grua, *NOMBRES_GRUA], key=f"n_{grua}",
+                    help="STS 1 y STS 2 son grúas STS; G5, G6, G9 y G10 son MHC."
                 )
-                with st.sidebar.expander(f"⚙️ {grua}", expanded=True):
+                renombres[grua] = nombre_sel
+                mostrar_leyenda_grua(
+                    nombre_sel, colores_config_gruas[grua], destino=st.sidebar
+                )
+                with st.sidebar.expander(f"⚙️ {nombre_sel}", expanded=True):
                     c1, c2 = st.columns(2)
                     d = c1.date_input("Fecha", datetime.today(), key=f"d_{grua}")
                     t = c2.time_input("Hora", time(8,0), key=f"t_{grua}")
@@ -1319,6 +1621,13 @@ def render_simulador():
                         "gmph": gmph_input,
                         "gmph_schedule": gmph_schedule,
                     }
+
+            if len(set(renombres.values())) < len(renombres):
+                st.error("Hay grúas con el mismo nombre; asigna un nombre distinto a cada una.")
+                st.stop()
+            df_raw = df_raw.assign(**{"Grúa": df_raw["Grúa"].map(renombres)})
+            config_gruas = {renombres[g]: c for g, c in config_gruas.items()}
+            lista_gruas = sorted(renombres.values())
 
             try:
                 df_cronograma = calcular_cronograma(df_raw, config_gruas)
@@ -1338,10 +1647,23 @@ def render_simulador():
                 c3.metric("Movimientos", int(total_movs))
                 
                 st.divider()
-                col_titulo, col_intervalo, col_orden = st.columns([2, 1, 1])
+                col_titulo, col_intervalo, col_orden = st.columns([2, 1, 1.4])
                 with col_titulo: st.subheader("Línea temporal de Working List")
                 with col_intervalo: intervalo_minutos = st.number_input("Grid Tiempo (min)", 10, 120, 60, 15)
-                with col_orden: orden_pref = st.selectbox("Orden de Bays", ["Mayor a Menor", "Menor a Mayor"], index=0)
+                with col_orden:
+                    orden_pref = st.selectbox(
+                        "Orden de Bays",
+                        ["Estribor muelle (mayor a menor)", "Babor muelle (menor a mayor)"], index=0,
+                    )
+                with st.expander("Ubicación de puente de mando y chimenea (opcional)"):
+                    bay_ini, bay_fin = int(df_cronograma["Bay Visual"].min()), int(df_cronograma["Bay Visual"].max())
+                    bays_ui = list(range(max(2, bay_ini - 16), bay_fin + 24 + 1, 4))
+                    opciones_bay = {"No indicar": None}
+                    for a, b in zip(bays_ui, bays_ui[1:]):
+                        opciones_bay[f"Entre bay {a:02d} y {b:02d}"] = (a, b)
+                    cp, cc = st.columns(2)
+                    ubic_puente = opciones_bay[cp.selectbox("¿Entre qué bays está el puente de mando?", list(opciones_bay))]
+                    ubic_chimenea = opciones_bay[cc.selectbox("¿Entre qué bays está la chimenea?", list(opciones_bay))]
                 st.caption("En BAY, D = cubierta y H = bodega. Achurado diagonal = cubierta; las barras sólidas son bodega o zona no identificada. Pasa el cursor para ver la zona detectada.")
                 sin_zona = (df_cronograma['Zona'] == "Sin identificar").sum()
                 if sin_zona:
@@ -1358,8 +1680,15 @@ def render_simulador():
 
                 min_bay = int(df_cronograma["Bay Visual"].min())
                 max_bay = int(df_cronograma["Bay Visual"].max())
+                for ubic in (ubic_puente, ubic_chimenea):
+                    if ubic:
+                        min_bay, max_bay = min(min_bay, ubic[0]), max(max_bay, ubic[1])
                 bays_completas = [f"{b:02d}" for b in range(min_bay, max_bay + 4, 4)]
-                lista_ordenada = sorted(bays_completas, reverse=(orden_pref == "Mayor a Menor"))
+                estribor_muelle = orden_pref.startswith("Estribor")
+                for ubic, slot in ((ubic_puente, SLOT_PUENTE), (ubic_chimenea, SLOT_CHIMENEA)):
+                    if ubic:
+                        bays_completas.insert(bays_completas.index(f"{ubic[0]:02d}") + 1, slot)
+                lista_ordenada = bays_completas[::-1] if estribor_muelle else bays_completas
 
                 range_y_start = inicio_min - timedelta(minutes=30)
                 range_y_end = fin_max + timedelta(minutes=30)
@@ -1421,13 +1750,17 @@ def render_simulador():
                             line_width=1.5,
                         )
 
+                agregar_buque_al_grafico(fig, lista_ordenada, estribor_muelle)
+                # Traza invisible: obliga a Plotly a mostrar todas las columnas, incluso las sin datos
+                fig.add_trace(go.Scatter(x=lista_ordenada, y=[range_y_start] * len(lista_ordenada), mode="markers",
+                                         marker=dict(opacity=0), showlegend=False, hoverinfo="skip"))
                 fig.update_layout(
-                    height=900, legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="right", x=1, font=dict(color='white'), bgcolor='rgba(0,0,0,0)'),
+                    height=900, legend=dict(orientation="h", yanchor="bottom", y=1 + 295 / ALTO_PLOT_GANTT, xanchor="right", x=1, font=dict(color='white'), bgcolor='rgba(0,0,0,0)'),
                     dragmode='pan', hovermode='closest', barmode='overlay', bargap=0.02,
                     plot_bgcolor=GANTT_BG_COLOR, paper_bgcolor=GANTT_BG_COLOR, font=dict(color='white'),
                     yaxis=dict(type='date', title="Hora", tickformat="%H:%M", tickfont=dict(color='white'), dtick=intervalo_minutos*60*1000, autorange="reversed", range=[range_y_start, range_y_end], gridcolor='#3a506b'),
-                    xaxis=dict(title="Bay (Serie Par)", type='category', categoryorder='array', categoryarray=lista_ordenada, side="top", tickfont=dict(color='white'), gridcolor='#000000', fixedrange=True),
-                    margin=dict(l=60, r=20, t=120, b=20)
+                    xaxis=dict(title=None, type='category', categoryorder='array', categoryarray=lista_ordenada, side="top", tickfont=dict(color='white'), gridcolor='#000000', fixedrange=True),
+                    margin=dict(l=60, r=20, t=900 - 20 - ALTO_PLOT_GANTT, b=20)
                 )
                 
                 config_zoom = {'scrollZoom': True, 'displayModeBar': True, 'modeBarButtonsToRemove': ['select2d', 'lasso2d']}
@@ -1437,108 +1770,43 @@ def render_simulador():
                 tabla_programa, resumen_programa = construir_programa_trabajo(df_cronograma)
                 nombre_buque = vessel_name or os.path.splitext(uploaded_file.name)[0]
                 clave_programa = f"{uploaded_file.name}_{abs(hash(uploaded_file.getvalue()))}"
+                total_programa = int(tabla_programa["Total"].iloc[-1])
+                horas_op = max(duracion_total, 1e-9)
+                horas_grua = (pd.to_datetime(df_cronograma["Fin"]) - pd.to_datetime(df_cronograma["Inicio"])).dt.total_seconds().sum() / 3600
                 encabezado_programa = pd.DataFrame([{
                     "Vessel name": nombre_buque,
-                    "Service": "",
                     "Discharge": resumen_programa["Discharge"],
                     "Loading": resumen_programa["Load"],
                     "Restow": resumen_programa["Restow"],
                     "Pontoons": resumen_programa["Pontoons"],
+                    "Rendimiento (mov/h)": f"{total_programa / horas_op:.0f}",
+                    "Crane density": f"{horas_grua / horas_op:.2f}",
                 }])
-                st.data_editor(
-                    encabezado_programa,
-                    column_config={
-                        "Vessel name": st.column_config.TextColumn("Vessel name"),
-                        "Service": st.column_config.TextColumn("Service"),
-                        **{
-                            campo: st.column_config.NumberColumn(campo, min_value=0, step=1)
-                            for campo in ("Discharge", "Loading", "Restow", "Pontoons")
-                        },
-                    },
-                    hide_index=True,
-                    num_rows="fixed",
-                    width="stretch",
-                    key=f"programa_encabezado_{clave_programa}",
-                )
+                mostrar_tabla_ejecutiva(encabezado_programa)
 
-                gruas_originales = list(tabla_programa.columns[1:-1])
-                numeros_grua = pd.DataFrame({
-                    "Crane": gruas_originales,
-                    "Number": [
-                        (re.search(r"\d+", grua).group(0) if re.search(r"\d+", grua) else grua)
-                        for grua in gruas_originales
-                    ],
-                })
-                numeros_grua = st.data_editor(
-                    numeros_grua,
-                    column_config={
-                        "Crane": st.column_config.TextColumn("Crane", disabled=True),
-                        "Number": st.column_config.TextColumn("Crane number"),
-                    },
-                    hide_index=True,
-                    num_rows="fixed",
-                    width="stretch",
-                    key=f"programa_numeros_grua_{clave_programa}",
-                )
-                nombres_gruas = {}
-                numeros_usados = set()
-                for grua, numero in zip(gruas_originales, numeros_grua["Number"]):
-                    numero = str(numero).strip() or grua
-                    if numero in numeros_usados:
-                        numero = f"{numero} ({grua})"
-                    numeros_usados.add(numero)
-                    nombres_gruas[grua] = numero
-                tabla_programa = tabla_programa.rename(columns=nombres_gruas)
-
-                columnas_programa = {
-                    "Operation": st.column_config.TextColumn("Operation"),
-                    **{
-                        grua: st.column_config.NumberColumn(grua, min_value=0, step=1)
-                        for grua in [*tabla_programa.columns[1:-1], "Total"]
-                    },
-                }
-                st.data_editor(
-                    tabla_programa,
-                    column_config=columnas_programa,
-                    hide_index=True,
-                    num_rows="fixed",
-                    width="stretch",
-                    key=f"programa_gruas_{clave_programa}",
-                )
+                mostrar_tabla_ejecutiva(tabla_programa, resaltar_ultima=True)
 
                 tabla_turnos = construir_tabla_turnos_trabajados(df_cronograma)
                 cantidad_turnos = len(tabla_turnos)
                 col_turnos, col_gangs = st.columns([1, 3])
                 with col_turnos:
-                    st.data_editor(
-                        pd.DataFrame({"Working Shifts": [cantidad_turnos]}),
-                        column_config={
-                            "Working Shifts": st.column_config.NumberColumn(
-                                "Working Shifts", min_value=0, step=1
-                            )
-                        },
-                        hide_index=True,
-                        num_rows="fixed",
-                        width="stretch",
-                        key=f"programa_turnos_{clave_programa}",
-                    )
+                    mostrar_tabla_ejecutiva(pd.DataFrame({"Working Shifts": [cantidad_turnos]}))
                 with col_gangs:
-                    st.data_editor(
-                        tabla_turnos,
-                        column_config={
-                            "Gangs shifts": st.column_config.TextColumn("Gangs shifts"),
-                            "Gangs / STS / MHC": st.column_config.TextColumn("Gangs / STS / MHC"),
-                        },
-                        hide_index=True,
-                        num_rows="dynamic",
-                        width="stretch",
-                        key=f"programa_gangs_{clave_programa}",
-                    )
+                    mostrar_tabla_ejecutiva(tabla_turnos)
 
-                st.text_input(
-                    "ETC",
-                    value=f"ETC {fin_max:%d/%m %H:%M} HRS TBC WP.",
-                    key=f"programa_etc_{clave_programa}",
+                st.markdown(
+                    f"<div class='etc-banner'><span>ESTIMATED TIME OF COMPLETION</span>"
+                    f"<b>ETC {fin_max:%d/%m %H:%M} HRS TBC WP.</b></div>",
+                    unsafe_allow_html=True,
+                )
+
+                st.sidebar.divider()
+                st.sidebar.download_button(
+                    "📄 Descargar reporte PDF",
+                    data=generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque),
+                    file_name=f"Reporte_Ejecutivo_{nombre_buque}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
                 )
             else: st.warning("No hay datos calculados.")
         else: st.error("Error al procesar PDF.")
