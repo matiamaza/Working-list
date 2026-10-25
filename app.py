@@ -7,6 +7,7 @@ import re
 import os
 import io
 import html
+import time as time_module
 from datetime import datetime, timedelta, time
 from interferencias import (
     comparar_cronogramas,
@@ -1714,6 +1715,12 @@ def construir_figura_gantt(
     )
     return fig
 
+METODOS_OPTIMIZACION = {
+    "Reparación rápida": {"tiempo_limite": 10, "activar_alns": False, "porcentaje_vecindad": 0.10},
+    "Híbrido recomendado": {"tiempo_limite": 20, "activar_alns": True, "porcentaje_vecindad": 0.10},
+    "Intensivo": {"tiempo_limite": 60, "activar_alns": True, "porcentaje_vecindad": 0.15},
+}
+
 def exportar_colas_excel(colas):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -1721,6 +1728,43 @@ def exportar_colas_excel(colas):
             nombre_hoja = re.sub(r'[\[\]:*?/\\]', '_', f"Cola {grua}")[:31]
             cola.to_excel(writer, sheet_name=nombre_hoja, index=False)
     return buffer.getvalue()
+
+def mostrar_resumen_optimizacion(propuesta, tiempo_total, interf_iniciales, interf_finales):
+    a = propuesta.attrs
+
+    def mm(clave):
+        v = a.get(clave)
+        return "—" if v is None else f"{v:.0f} min"
+
+    final, semilla = a.get("makespan_final_min"), a.get("makespan_semilla_min")
+    with st.expander("Resumen de la optimización", expanded=True):
+        st.write(f"Estado: {'✅ factible' if a.get('factible') else '❌ no factible'}")
+        filas = [
+            ("Makespan de la semilla", mm("makespan_semilla_min")),
+            ("Primera solución factible", mm("makespan_primera_factible_min")),
+            ("Antes del ALNS", mm("makespan_antes_alns_min")),
+            ("Mejor candidata del ALNS", mm("makespan_mejor_candidata_alns_min")),
+            ("Makespan final", mm("makespan_final_min")),
+        ]
+        if final is not None and semilla:
+            filas.append(("Mejora respecto de la semilla", f"{semilla - final:+.0f} min ({(semilla - final) / semilla * 100:+.1f} %)"))
+        filas += [
+            ("Interferencias iniciales → finales", f"{interf_iniciales} → {interf_finales}"),
+            ("Cruces finales", a.get("cruces_finales", "—")),
+            ("Movimientos conservados", "Sí" if a.get("movimientos_conservados") else "No"),
+            ("Grúas disponibles / utilizadas", f"{a.get('gruas_disponibles', '—')} / {a.get('gruas_utilizadas', '—')}"),
+            ("Iteraciones ALNS", a.get("iteraciones_alns", 0)),
+            ("Candidatas diferentes", a.get("candidatas_distintas", 0)),
+            ("Operador ganador", a.get("operador_destruccion_ganador") or "—"),
+            ("Tiempo total", "—" if tiempo_total is None else f"{tiempo_total:.1f} s"),
+        ]
+        st.table(pd.DataFrame(filas, columns=["Indicador", "Valor"]).astype(str).set_index("Indicador"))
+        antes = a.get("makespan_antes_alns_min")
+        if a.get("iteraciones_alns") and antes is not None and final is not None and final >= antes - 1.0:
+            st.info(
+                "El ALNS exploró alternativas factibles, pero no encontró una solución mejor que el incumbente "
+                "inicial dentro del tiempo disponible."
+            )
 
 def mostrar_analisis_interferencias(
     df_cronograma, config_gruas, mapa_colores, lista_ordenada, estribor_muelle,
@@ -1746,6 +1790,29 @@ def mostrar_analisis_interferencias(
         + ". La propuesta nunca invierte este orden y mantiene al menos 8 bays visuales entre grúas que trabajan a la vez."
     )
     st.caption("Configura primero los turnos y rendimientos de cada grúa; luego presiona el botón para analizar.")
+    with st.expander("Configuración de optimización"):
+        metodo_opt = st.radio(
+            "Método", list(METODOS_OPTIMIZACION), index=1, key="metodo_optimizacion", horizontal=True,
+            help="Reparación rápida: sin ALNS. Híbrido: mejora local + ALNS + intensificación final. Intensivo: lo mismo con más tiempo y vecindad mayor.",
+        )
+        base_metodo = METODOS_OPTIMIZACION[metodo_opt]
+        c1, c2 = st.columns(2)
+        tiempo_opt = c1.selectbox(
+            "Tiempo límite (s)", [10, 20, 30, 60], index=[10, 20, 30, 60].index(base_metodo["tiempo_limite"]),
+            key=f"tiempo_opt_{metodo_opt}",
+        )
+        permitir_reasig = c1.checkbox("Permitir reasignación", True, key="opt_reasignacion")
+        permitir_div = c2.checkbox("Permitir división", True, key="opt_division")
+        usar_alns = c2.checkbox("Activar ALNS", base_metodo["activar_alns"], key=f"opt_alns_{metodo_opt}")
+        usar_cp = c2.checkbox("Usar CP-SAT local", True, key="opt_cpsat_local")
+        with st.expander("Configuración avanzada"):
+            semilla_opt = st.number_input("Random seed", 0, 99999, 42, 1, key="opt_seed")
+    params_opt = {
+        "tiempo_limite": tiempo_opt, "random_seed": int(semilla_opt), "activar_alns": usar_alns,
+        "permitir_reasignacion": permitir_reasig, "permitir_division": permitir_div, "usar_cpsat_local": usar_cp,
+        "porcentaje_vecindad": base_metodo["porcentaje_vecindad"], "activar_mejora_local": True,
+        "activar_mejora_local_inicial": True, "activar_intensificacion_final": usar_alns,
+    }
     if st.button("🔍 Analizar interferencias", type="primary", key="btn_analizar_interferencias"):
         resultado = {"firma": firma_actual, "holgura": holgura}
         resultado["interferencias"] = detectar_interferencias(df_cronograma, holgura)
@@ -1753,10 +1820,12 @@ def mostrar_analisis_interferencias(
         resultado["error"] = None
         if not resultado["interferencias"].empty:
             try:
-                with st.spinner("Optimizando la secuencia (puede tardar hasta ~20 s)..."):
+                with st.spinner(f"Optimizando la secuencia (puede tardar hasta ~{params_opt['tiempo_limite']} s)..."):
+                    t_inicio_opt = time_module.monotonic()
                     resultado["propuesta"] = proponer_secuencia(
-                        df_cronograma, config_gruas, calcular_intervalo_tarea, holgura
+                        df_cronograma, config_gruas, calcular_intervalo_tarea, holgura, **params_opt
                     )
+                    resultado["tiempo_total"] = time_module.monotonic() - t_inicio_opt
             except ValueError as e:
                 resultado["error"] = str(e)
         st.session_state["analisis_interferencias"] = resultado
@@ -1802,6 +1871,7 @@ def mostrar_analisis_interferencias(
     st.dataframe(comparacion, use_container_width=True, hide_index=True)
     if propuesta.attrs.get("metodo"):
         st.caption(f"Método elegido: {propuesta.attrs['metodo']}")
+    mostrar_resumen_optimizacion(propuesta, resultado.get("tiempo_total"), len(interferencias), restantes)
     st.caption(
         "La propuesta puede mover y partir tareas entre grúas, respetando el orden original dentro de cada bay "
         "(descarga antes que embarque, cubierta antes que bodega) y los pontones en su grúa. "

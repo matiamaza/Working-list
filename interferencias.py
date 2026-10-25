@@ -4,6 +4,7 @@ Dos grúas interfieren cuando trabajan en el mismo bay (visual) o en bays visual
 contiguos con intervalos de tiempo que coinciden o quedan separados por menos que
 la holgura de seguridad. Cubierta y bodega del mismo bay cuentan como el mismo bay.
 """
+import contextlib
 import itertools
 import math
 import random
@@ -22,11 +23,23 @@ MIN_PARTE = 6
 MIN_PARTE_CPSAT = 20
 TIEMPO_MAX_CPSAT = 20
 MAX_REINTENTOS = 200
+MAX_HUECOS_POR_GRUA = 8
 # Dos makespan que difieren en esta cantidad de minutos o menos se consideran empatados.
 TOLERANCIA_MAKESPAN_MIN = 1.0
 FRACCION_TIEMPO_HEURISTICAS = 0.5
 FRACCION_TIEMPO_CPSAT = 0.4
+FRACCION_ALNS_HEURISTICAS = 0.35
+FRACCION_ALNS_CPSAT = 0.25
+# Presupuesto máximo por fase como fracción del tiempo total; lo que una fase no usa pasa a las siguientes
+# y el ALNS recibe todo el tiempo restante (menos la reserva de la intensificación final).
+PRESUPUESTO_FASES = {"candidatos": 0.30, "reparacion": 0.25, "mejora_inicial": 0.25, "alns": 0.30, "final": 0.05}
 MAX_ITERACIONES_REPARACION = 30
+PARAMETROS_PREDETERMINADOS = {
+    "tiempo_limite": 20, "random_seed": 42, "workers": 4, "activar_alns": True, "porcentaje_vecindad": 0.10,
+    "permitir_reasignacion": True, "permitir_division": True, "usar_simulated_annealing": True,
+    "usar_cpsat_local": True, "orden_fisico_gruas": None, "activar_mejora_local_inicial": True,
+    "activar_intensificacion_final": True,
+}
 MAX_BARRIDOS_MEJORA = 6
 COLUMNAS_IDENTIDAD = ["Task_ID", "Parent_Task_ID", "Fragment_ID"]
 
@@ -146,6 +159,20 @@ def construir_precedencias(tareas, reglas=None):
             if par not in aristas:
                 aristas.append(par)
     return aristas
+
+
+def verificar_precedencias(df_resultado, df_semilla):
+    """Aristas heredadas de la semilla que el resultado rompe (lista vacía = todas se cumplen).
+
+    Verificación independiente del contexto: la predecesora debe terminar, con todos sus fragmentos,
+    antes de que comience el primer fragmento de su sucesora.
+    """
+    semilla = _asegurar_identidad(df_semilla)
+    aristas = construir_precedencias(_tareas_desde_cronograma(semilla))
+    inicio = pd.to_datetime(df_resultado["Inicio"]).groupby(df_resultado["Parent_Task_ID"]).min()
+    fin = pd.to_datetime(df_resultado["Fin"]).groupby(df_resultado["Parent_Task_ID"]).max()
+    tolerancia = pd.Timedelta(seconds=1)
+    return [(a, b) for a, b in aristas if a in fin.index and b in inicio.index and fin[a] > inicio[b] + tolerancia]
 
 
 def _predecesoras(aristas):
@@ -292,7 +319,8 @@ def _evaluar(tarea, grua, params, desde, ctx, intervalo_fn):
             return inicio, fin, duracion, movs
 
         ya_activos = [o for o in conflictos if o["ini"] - margen <= inicio]
-        if ctx.get("dividir", True) and not ya_activos and tarea["dur_fija"] is None and movs >= 2 * MIN_PARTE:
+        if ctx.get("dividir", True) and tarea["id"] not in ctx.get("no_dividir", ()) \
+                and not ya_activos and tarea["dur_fija"] is None and movs >= 2 * MIN_PARTE:
             limite = min(o["ini"] for o in conflictos) - margen
             k = min(_max_movs_hasta(params, inicio_busqueda, limite, movs, intervalo_fn), movs - MIN_PARTE)
             if k >= MIN_PARTE:
@@ -480,6 +508,17 @@ class _Incumbente:
         self.mejor = ev
         self.version += 1
         return True, motivo
+
+
+@contextlib.contextmanager
+def _fase(cx, limite_fase):
+    """Limita temporalmente el deadline del contexto al de la fase (nunca más allá del global)."""
+    previo = cx["limite"]
+    cx["limite"] = min(previo, limite_fase)
+    try:
+        yield
+    finally:
+        cx["limite"] = previo
 
 
 def _fallo(cx, etapa, error):
@@ -723,10 +762,33 @@ def resolver_orden_fisico(df_cronograma, orden_fisico_gruas=None):
     return {g: i for i, g in enumerate(ordenadas)}
 
 
+def crear_contexto(
+    semilla, config_gruas, intervalo_fn, holgura, rango, limite, permitir_reasignacion=True,
+    permitir_division=True, debug=False, t0=None,
+):
+    """Contexto de optimización: la semilla (ya normalizada) como referencia y las reglas heredadas."""
+    tareas = _tareas_desde_cronograma(semilla)
+    aristas = construir_precedencias(tareas)
+    return {
+        "reasignar": bool(permitir_reasignacion), "dividir": bool(permitir_division),
+        "inicios": {g: pd.Timestamp(config_gruas[g]["inicio"]) for g in semilla["Grúa"].unique()},
+        "semilla": semilla, "tareas": tareas, "tareas_por_id": {t["id"]: t for t in tareas},
+        "aristas": aristas, "preds": _predecesoras(aristas), "rango": rango, "config": config_gruas,
+        "intervalo_fn": intervalo_fn, "holgura": holgura, "gruas": sorted({t["grua"] for t in tareas}),
+        "t_ref": pd.to_datetime(semilla["Inicio"]).min(),
+        "ini_semilla": pd.to_datetime(semilla["Inicio"]).groupby(semilla["Parent_Task_ID"]).min(),
+        "limite": limite, "debug": debug, "t0": time.monotonic() if t0 is None else t0,
+        "iteracion": 0, "historial": [], "fallos": [], "iter_reparacion": 0, "iter_mejora": 0,
+    }
+
+
 def proponer_secuencia(
     df_cronograma, config_gruas, intervalo_fn, holgura=15, tiempo_limite=TIEMPO_MAX_CPSAT,
-    random_seed=42, workers=4, activar_reparacion_iterativa=True, activar_mejora_local=True, debug=False,
-    orden_fisico_gruas=None, permitir_reasignacion=True, permitir_division=True,
+    random_seed=42, workers=4, activar_reparacion_iterativa=True, activar_mejora_local=True,
+    activar_alns=True, porcentaje_vecindad=0.10, permitir_reasignacion=True, permitir_division=True,
+    usar_simulated_annealing=True, orden_fisico_gruas=None, debug=False,
+    usar_cpsat_local=True, max_iteraciones_alns=None, activar_mejora_local_inicial=True,
+    activar_intensificacion_final=True, presupuesto_fases=None,
 ):
     """Propone una secuencia sin interferencias ni cruces de grúas, con libertad para rehacerla.
 
@@ -752,27 +814,21 @@ def proponer_secuencia(
     t0 = time.monotonic()
     total = max(float(tiempo_limite), 0.5)
     limite_total = t0 + total
-    limite_heuristicas = t0 + FRACCION_TIEMPO_HEURISTICAS * total
+    fr = {**PRESUPUESTO_FASES, **(presupuesto_fases or {})}
+    fraccion_heuristicas = fr["candidatos"] if activar_alns else FRACCION_TIEMPO_HEURISTICAS
+    fraccion_cpsat = FRACCION_ALNS_CPSAT if activar_alns else FRACCION_TIEMPO_CPSAT
+    limite_heuristicas = t0 + fraccion_heuristicas * total
     semilla = _asegurar_identidad(df_cronograma)
     if "Grúa original" not in semilla.columns:
         semilla["Grúa original"] = semilla["Grúa"]
-    tareas = _tareas_desde_cronograma(semilla)
-    aristas = construir_precedencias(tareas)
     rango = resolver_orden_fisico(semilla, orden_fisico_gruas)
-    cx = {
-        "reasignar": bool(permitir_reasignacion), "dividir": bool(permitir_division),
-        "inicios": {g: pd.Timestamp(config_gruas[g]["inicio"]) for g in semilla["Grúa"].unique()},
-        "semilla": semilla, "tareas": tareas, "tareas_por_id": {t["id"]: t for t in tareas},
-        "aristas": aristas, "preds": _predecesoras(aristas), "rango": rango, "config": config_gruas,
-        "intervalo_fn": intervalo_fn, "holgura": holgura, "gruas": sorted({t["grua"] for t in tareas}),
-        "t_ref": pd.to_datetime(semilla["Inicio"]).min(),
-        "ini_semilla": pd.to_datetime(semilla["Inicio"]).groupby(semilla["Parent_Task_ID"]).min(),
-        "limite": limite_total, "debug": debug, "t0": t0, "iteracion": 0, "historial": [], "fallos": [],
-        "iter_reparacion": 0, "iter_mejora": 0,
-    }
+    cx = crear_contexto(
+        semilla, config_gruas, intervalo_fn, holgura, rango, limite_total,
+        permitir_reasignacion, permitir_division, debug, t0,
+    )
+    tareas, aristas = cx["tareas"], cx["aristas"]
     rnd = random.Random(random_seed)
     inc = _Incumbente()
-
     ev_semilla = None
     try:
         ev_semilla = _evaluar_plan(semilla, cx, "Semilla")
@@ -804,7 +860,7 @@ def proponer_secuencia(
             )),
         )
 
-    tiempo_cpsat = min(FRACCION_TIEMPO_CPSAT * total, limite_heuristicas - time.monotonic())
+    tiempo_cpsat = min(fraccion_cpsat * total, limite_heuristicas - time.monotonic())
     if tiempo_cpsat >= 1.0:
         pista = inc.mejor["df"] if inc.mejor is not None and inc.mejor["factible"] else None
         _probar(
@@ -816,22 +872,83 @@ def proponer_secuencia(
             ),
         )
 
+    ms_fases = {"inicial": inc.mejor["ms"] if inc.mejor is not None and inc.mejor["factible"] else None}
+    tiempos_fases = {}
+    snapshots = []
+
+    def _snapshot():
+        if inc.mejor is not None and inc.mejor["factible"]:
+            snapshots.append(inc.mejor)
+
     if activar_reparacion_iterativa:
+        t_fase = time.monotonic()
         try:
-            if ev_semilla is not None and ev_semilla["utilizable"] and not ev_semilla["factible"]:
-                _reparar_iterativo(cx, inc, ev_semilla, "reparación de la semilla")
-            if inc.mejor is not None and not inc.mejor["factible"]:
-                _reparar_iterativo(cx, inc, inc.mejor)
+            with _fase(cx, t_fase + fr["reparacion"] * total):
+                if ev_semilla is not None and ev_semilla["utilizable"] and not ev_semilla["factible"]:
+                    _reparar_iterativo(cx, inc, ev_semilla, "reparación de la semilla")
+                if inc.mejor is not None and not inc.mejor["factible"]:
+                    _reparar_iterativo(cx, inc, inc.mejor)
         except Exception as e:
             _fallo(cx, "reparación iterativa", e)
+        tiempos_fases["reparacion"] = round(time.monotonic() - t_fase, 3)
+    ms_fases["inicial"] = inc.mejor["ms"] if inc.mejor is not None and inc.mejor["factible"] else None
+    _snapshot()
 
-    if activar_mejora_local and inc.mejor is not None and inc.mejor["factible"]:
+    estado_alns = None
+    factible_ahora = inc.mejor is not None and inc.mejor["factible"]
+    if not activar_alns:
+        if activar_mejora_local and factible_ahora:
+            try:
+                _mejorar_local(cx, inc, rnd)
+            except Exception as e:
+                _fallo(cx, "mejora local", e)
+        ms_fases["tras_mejora_inicial"] = inc.mejor["ms"] if factible_ahora else None
+    elif factible_ahora:
+        if activar_mejora_local and activar_mejora_local_inicial:
+            t_fase = time.monotonic()
+            try:
+                with _fase(cx, t_fase + fr["mejora_inicial"] * total):
+                    _mejorar_local(cx, inc, rnd)
+            except Exception as e:
+                _fallo(cx, "mejora local inicial", e)
+            tiempos_fases["mejora_local_inicial"] = round(time.monotonic() - t_fase, 3)
+        ms_fases["tras_mejora_inicial"] = inc.mejor["ms"]
+        _snapshot()
+        reserva = 0.0
+        if activar_intensificacion_final:
+            reserva = max(fr["final"] * total, 0.75)
+            if limite_total - time.monotonic() < 3 * reserva:
+                reserva = max(0.0, min(reserva, 0.2 * (limite_total - time.monotonic())))
+        t_fase = time.monotonic()
         try:
-            _mejorar_local(cx, inc, rnd)
+            import alns
+            with _fase(cx, limite_total - reserva):
+                estado_alns = alns.ejecutar_alns(
+                    cx, inc, rnd, porcentaje_vecindad, usar_simulated_annealing, usar_cpsat_local,
+                    max_iteraciones_alns,
+                )
         except Exception as e:
-            _fallo(cx, "mejora local", e)
+            _fallo(cx, "ALNS", e)
+        tiempos_fases["alns"] = round(time.monotonic() - t_fase, 3)
+        ms_fases["tras_alns"] = inc.mejor["ms"]
+        _snapshot()
+        if activar_intensificacion_final and limite_total - time.monotonic() >= 0.5:
+            t_fase = time.monotonic()
+            try:
+                with _fase(cx, t_fase + max(fr["final"] * total, 0.75)):
+                    _mejorar_local(cx, inc, rnd)
+            except Exception as e:
+                _fallo(cx, "intensificación final", e)
+            tiempos_fases["intensificacion_final"] = round(time.monotonic() - t_fase, 3)
+        ms_fases["tras_intensificacion_final"] = inc.mejor["ms"]
+        _snapshot()
 
-    mejor = inc.mejor if inc.mejor is not None else ev_semilla
+    mejor = inc.mejor
+    for candidato in snapshots:
+        if mejor is None or _comparar_planes(candidato, mejor)[0]:
+            mejor = candidato
+    if mejor is None:
+        mejor = ev_semilla
     if mejor is not None:
         propuesta = mejor["df"].reset_index(drop=True).copy()
         metodo = mejor["metodo"] if mejor["factible"] else f"{mejor['metodo']} (no completamente factible)"
@@ -864,6 +981,39 @@ def proponer_secuencia(
         "historial": cx["historial"],
         "fallos": cx["fallos"],
     })
+    disponibles = sorted(config_gruas) if hasattr(config_gruas, "keys") else sorted(cx["gruas"])
+    usadas = sorted(set(propuesta["Grúa"].dropna())) if "Grúa" in propuesta else []
+    propuesta.attrs.update({
+        "alns_activado": estado_alns is not None and getattr(estado_alns, "iniciado", False),
+        "iteraciones_alns": 0, "candidatas_alns": 0, "candidatas_factibles_alns": 0,
+        "candidatas_aceptadas_alns": 0, "mejoras_alns": 0, "operador_destruccion_ganador": None,
+        "operador_reparacion_ganador": None, "pesos_destruccion": {}, "pesos_reparacion": {},
+        "estadisticas_operadores": {}, "temperatura_final": None, "reinicios_alns": 0,
+        "gruas_disponibles": len(disponibles), "gruas_utilizadas": len(usadas),
+        "gruas_sin_tareas": [g for g in disponibles if g not in usadas],
+        "fragmentos_finales": int(len(propuesta)),
+        "tareas_originales": int(propuesta["Parent_Task_ID"].nunique()) if "Parent_Task_ID" in propuesta else None,
+        "precedencias_validas": bool(mejor["val"]["precedencias_validas"]) if mejor else False,
+        "makespan_inicial_candidatos_min": ms_fases.get("inicial"),
+        "makespan_antes_alns_min": ms_fases.get("tras_mejora_inicial"),
+        "makespan_tras_alns_min": ms_fases.get("tras_alns"),
+        "makespan_mejor_candidata_alns_min": None,
+        "makespan_tras_intensificacion_min": ms_fases.get("tras_intensificacion_final"),
+        "tiempos_fases_seg": tiempos_fases,
+        "estadisticas_diversidad": {}, "estadisticas_cp_local": {},
+        "candidatas_distintas": 0, "porcentaje_candidatas_identicas": 0.0,
+        "activar_mejora_local_inicial": bool(activar_mejora_local_inicial),
+        "activar_intensificacion_final": bool(activar_intensificacion_final),
+    })
+    if estado_alns is not None:
+        resumen = estado_alns.resumen()
+        propuesta.attrs.update(resumen)
+        propuesta.attrs["makespan_mejor_candidata_alns_min"] = resumen["makespan_mejor_candidata_alns"]
+        propuesta.attrs["candidatas_distintas"] = resumen["estadisticas_diversidad"]["candidatas_distintas"]
+        propuesta.attrs["porcentaje_candidatas_identicas"] = resumen["estadisticas_diversidad"][
+            "porcentaje_candidatas_identicas"
+        ]
+        propuesta.attrs["alns_activado"] = bool(getattr(estado_alns, "iniciado", False))
     return propuesta
 
 
@@ -933,6 +1083,7 @@ def _nueva_pieza(grua, tarea, movs, ini, fin, dur, fragmentos):
 
 def _registrar_pieza(ctx, disponible, pieza):
     tarea, grua = pieza["tarea"], pieza["grua"]
+    ctx.setdefault("propias", {}).setdefault(grua, []).append((pieza["ini"], pieza["fin"]))
     if tarea["bay"] is not None:
         ctx["ocupaciones"].append({"grua": grua, "bay": tarea["bay"], "ini": pieza["ini"], "fin": pieza["fin"]})
         previo_bay, previo_fin = ctx["posicion"][grua]
@@ -957,14 +1108,16 @@ def _gruas_permitidas(tarea, gruas, excluidas, forzadas, reasignar=True):
 def _despachar(
     tareas, config_gruas, intervalo_fn, holgura_min, criterio, rango, asignacion=None,
     piezas_previas=(), excluidas=None, forzadas=None, limite=None, aristas=None,
-    permitir_reasignacion=True, permitir_division=True,
+    permitir_reasignacion=True, permitir_division=True, huecos=False, prioridades=None, sin_dividir=(),
 ):
     """Despacho voraz de las tareas no congeladas; no modifica `tareas` ni `piezas_previas`.
 
     `piezas_previas` son piezas ya fijas (tareas completas): ocupan su grúa y sus bays y satisfacen
     precedencias. `excluidas`/`forzadas` (id de tarea → grúas / grúa) orientan la asignación.
-    Criterios: "inicio", "fin", "fin_sin_preferencia" y "regret2" (primero la tarea con mayor
-    pérdida si no se le da su mejor grúa). Retorna la lista completa de piezas.
+    Criterios: "inicio", "fin", "fin_sin_preferencia", "regret2" (primero la tarea con mayor
+    pérdida si no se le da su mejor grúa) y "prioridad" (menor `prioridades[id]` primero).
+    Con `huecos` las tareas pueden insertarse en huecos libres de la grúa, no solo al final.
+    `sin_dividir` son ids de tareas que no se parten. Retorna la lista completa de piezas.
     """
     margen = timedelta(minutes=holgura_min)
     gruas = sorted({t["grua"] for t in tareas})
@@ -972,9 +1125,11 @@ def _despachar(
     preds = _predecesoras(aristas)
 
     disponible = {g: pd.Timestamp(config_gruas[g]["inicio"]) for g in gruas}
+    inicio_cfg = dict(disponible)
     ctx = {
         "margen": margen, "rango": rango, "ocupaciones": [], "tramos": [],
         "posicion": {g: (None, disponible[g]) for g in gruas}, "dividir": permitir_division,
+        "no_dividir": set(sin_dividir),
     }
     piezas = []
     fragmentos = defaultdict(int)
@@ -1003,14 +1158,29 @@ def _despachar(
             for grua in _gruas_permitidas(tarea, gruas, excluidas, forzadas, permitir_reasignacion):
                 if asignacion and asignacion.get(tarea["clave"], grua) != grua:
                     continue
-                desde = max(disponible[grua], listo)
-                resultado = _evaluar(vista, grua, config_gruas[grua], desde.to_pydatetime(), ctx, intervalo_fn)
-                if resultado is None:
-                    continue
-                preferencia = 0 if (tarea["grua"] == grua or criterio == "fin_sin_preferencia") else 1
-                referencia = resultado[0] if criterio == "inicio" else resultado[1]
-                prioridad = (referencia, preferencia, resultado[0], tarea["orig_ini"], tarea["orden"], grua)
-                opciones[tid].append((prioridad, grua, vista, resultado))
+                if huecos:
+                    base = max(inicio_cfg[grua], listo)
+                    propias = ctx.get("propias", {}).get(grua, [])
+                    candidatos = [base] + sorted({f for _, f in propias if f > base})[:MAX_HUECOS_POR_GRUA]
+                else:
+                    candidatos = [max(disponible[grua], listo)]
+                mejor_grua = None
+                for desde in candidatos:
+                    resultado = _evaluar(vista, grua, config_gruas[grua], desde.to_pydatetime(), ctx, intervalo_fn)
+                    if resultado is None:
+                        continue
+                    if huecos and any(
+                        pd.Timestamp(resultado[0]) < f and i < pd.Timestamp(resultado[1])
+                        for i, f in ctx.get("propias", {}).get(grua, [])
+                    ):
+                        continue
+                    preferencia = 0 if (tarea["grua"] == grua or criterio == "fin_sin_preferencia") else 1
+                    referencia = resultado[0] if criterio == "inicio" else resultado[1]
+                    prioridad = (referencia, preferencia, resultado[0], tarea["orig_ini"], tarea["orden"], grua)
+                    if mejor_grua is None or prioridad < mejor_grua[0]:
+                        mejor_grua = (prioridad, grua, vista, resultado)
+                if mejor_grua is not None:
+                    opciones[tid].append(mejor_grua)
 
         if not opciones:
             raise ValueError(
@@ -1025,6 +1195,8 @@ def _despachar(
                     return float("inf")
                 return (lista[1][0][0] - lista[0][0][0]).total_seconds()
             tid = min(mejores, key=lambda t: (-arrepentimiento(t), mejores[t][0][0]))
+        elif criterio == "prioridad":
+            tid = min(mejores, key=lambda t: ((prioridades or {}).get(t, ()), mejores[t][0][0]))
         else:
             tid = min(mejores, key=lambda t: mejores[t][0][0])
         _, grua, vista, (inicio, fin, duracion, movs_parte) = mejores[tid][0]
