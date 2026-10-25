@@ -5,13 +5,15 @@ contiguos con intervalos de tiempo que coinciden o quedan separados por menos qu
 la holgura de seguridad. Cubierta y bodega del mismo bay cuentan como el mismo bay.
 """
 import contextlib
+import hashlib
 import itertools
+import json
 import math
 import random
 import re
 import time
 from collections import defaultdict, deque
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -755,6 +757,9 @@ def resolver_orden_fisico(df_cronograma, orden_fisico_gruas=None):
         ordenadas = sorted(orden_fisico_gruas, key=lambda g: (orden_fisico_gruas[g], g))
     else:
         ordenadas = list(orden_fisico_gruas)
+    repetidas = sorted({g for g in ordenadas if ordenadas.count(g) > 1})
+    if repetidas:
+        raise ValueError(f"El orden físico repite a las grúas: {repetidas}")
     faltan = [g for g in gruas if g not in ordenadas]
     if faltan:
         raise ValueError(f"El orden físico no incluye a las grúas: {faltan}")
@@ -782,13 +787,50 @@ def crear_contexto(
     }
 
 
+def firma_entrada(df_cronograma, config_gruas):
+    """Huella estable (sha256 abreviado) de la semilla y de la configuración de grúas, independiente del índice."""
+    columnas = [c for c in ("Grúa", "Bay Real", "Acción", "Movimientos", "Inicio", "Fin") if c in df_cronograma.columns]
+    filas = sorted(
+        "|".join(str(v) for v in fila) for fila in df_cronograma[columnas].itertuples(index=False, name=None)
+    )
+    cfg = {
+        str(g): {k: (repr(v) if not isinstance(v, (int, float, str)) else v) for k, v in sorted(c.items())}
+        for g, c in sorted(config_gruas.items(), key=lambda par: str(par[0]))
+    }
+    cuerpo = json.dumps({"filas": filas, "config": cfg}, sort_keys=True, ensure_ascii=True, default=repr)
+    return hashlib.sha256(cuerpo.encode("utf-8")).hexdigest()[:16]
+
+
+def estado_solucion(attrs):
+    """Clasifica el resultado a partir de `propuesta.attrs`; tolera attrs antiguos o ausentes."""
+    a = attrs or {}
+    if not a.get("factible", False):
+        return "Solución parcialmente reparada"
+    ms_semilla, ms_final = a.get("makespan_semilla_min"), a.get("makespan_final_min")
+    semilla_factible = a.get("semilla_factible")
+    if semilla_factible is None:
+        semilla_factible = not a.get("interferencias_semilla") and not a.get("cruces_semilla")
+    if not semilla_factible:
+        return "Solución reparada"
+    if ms_semilla is not None and ms_final is not None and ms_final < ms_semilla - TOLERANCIA_MAKESPAN_MIN:
+        return "Solución factible mejorada"
+    return "Solución factible mantenida"
+
+
+def resumen_cp_local(estadisticas):
+    """Texto/valores del CP-SAT local; 'Sin ejecuciones' si no se ejecutó."""
+    if not estadisticas or not estadisticas.get("ejecuciones"):
+        return "Sin ejecuciones"
+    return estadisticas
+
+
 def proponer_secuencia(
     df_cronograma, config_gruas, intervalo_fn, holgura=15, tiempo_limite=TIEMPO_MAX_CPSAT,
     random_seed=42, workers=4, activar_reparacion_iterativa=True, activar_mejora_local=True,
     activar_alns=True, porcentaje_vecindad=0.10, permitir_reasignacion=True, permitir_division=True,
     usar_simulated_annealing=True, orden_fisico_gruas=None, debug=False,
     usar_cpsat_local=True, max_iteraciones_alns=None, activar_mejora_local_inicial=True,
-    activar_intensificacion_final=True, presupuesto_fases=None,
+    activar_intensificacion_final=True, presupuesto_fases=None, modo_reproducible=False,
 ):
     """Propone una secuencia sin interferencias ni cruces de grúas, con libertad para rehacerla.
 
@@ -812,6 +854,9 @@ def proponer_secuencia(
     `attrs["factible"] = False`. Los metadatos quedan en `propuesta.attrs`.
     """
     t0 = time.monotonic()
+    if modo_reproducible:
+        workers = 1
+    info_cpsat = {}
     total = max(float(tiempo_limite), 0.5)
     limite_total = t0 + total
     fr = {**PRESUPUESTO_FASES, **(presupuesto_fases or {})}
@@ -869,6 +914,7 @@ def proponer_secuencia(
                 semilla, config_gruas, intervalo_fn, holgura, rango, tiempo_cpsat, pista,
                 workers=workers, semilla_aleatoria=random_seed,
                 permitir_reasignacion=permitir_reasignacion, permitir_division=permitir_division,
+                info=info_cpsat,
             ),
         )
 
@@ -992,6 +1038,12 @@ def proponer_secuencia(
         "gruas_disponibles": len(disponibles), "gruas_utilizadas": len(usadas),
         "gruas_sin_tareas": [g for g in disponibles if g not in usadas],
         "fragmentos_finales": int(len(propuesta)),
+        "semilla_factible": bool(ev_semilla["factible"]) if ev_semilla else None,
+        "cruces_semilla": ev_semilla["cruces"] if ev_semilla else None,
+        "workers": int(workers), "tiempo_limite": tiempo_limite, "modo_reproducible": bool(modo_reproducible),
+        "version_ortools": _version_ortools(), "fecha_ejecucion": datetime.now().isoformat(timespec="seconds"),
+        "firma_entrada": firma_entrada(df_cronograma, config_gruas),
+        "cpsat_global_estado": info_cpsat.get("estado"), "cpsat_global_mejor_cota": info_cpsat.get("mejor_cota"),
         "tareas_originales": int(propuesta["Parent_Task_ID"].nunique()) if "Parent_Task_ID" in propuesta else None,
         "precedencias_validas": bool(mejor["val"]["precedencias_validas"]) if mejor else False,
         "makespan_inicial_candidatos_min": ms_fases.get("inicial"),
@@ -1014,7 +1066,22 @@ def proponer_secuencia(
             "porcentaje_candidatas_identicas"
         ]
         propuesta.attrs["alns_activado"] = bool(getattr(estado_alns, "iniciado", False))
+    pf = inc.primera_factible_ms
+    semilla_ok = propuesta.attrs["semilla_factible"]
+    propuesta.attrs["variacion_para_factibilidad_min"] = (
+        pf - ms_semilla if pf is not None and semilla_ok is False else 0.0
+    )
+    propuesta.attrs["mejora_desde_primera_factible_min"] = pf - ms_final if pf is not None else None
+    propuesta.attrs["estado_solucion"] = estado_solucion(propuesta.attrs)
     return propuesta
+
+
+def _version_ortools():
+    try:
+        import ortools
+        return getattr(ortools, "__version__", None)
+    except ImportError:
+        return None
 
 
 def _asignaciones_por_zonas(df_cronograma, config_gruas, rango, max_candidatas=8):
@@ -1257,7 +1324,7 @@ def _pista_partes(partes, plan):
 
 def _proponer_cpsat(
     df_cronograma, config_gruas, intervalo_fn, holgura_min, rango, tiempo_max, pista=None,
-    workers=4, semilla_aleatoria=42, permitir_reasignacion=True, permitir_division=True,
+    workers=4, semilla_aleatoria=42, permitir_reasignacion=True, permitir_division=True, info=None,
 ):
     """Optimiza con CP-SAT (OR-Tools) la asignación y el orden de tareas para minimizar el término.
 
@@ -1400,6 +1467,12 @@ def _proponer_cpsat(
     solver.parameters.num_workers = max(1, int(workers))
     solver.parameters.random_seed = int(semilla_aleatoria)
     estado = solver.Solve(modelo)
+    if info is not None:
+        info["estado"] = solver.StatusName(estado)
+        try:
+            info["mejor_cota"] = solver.BestObjectiveBound()
+        except Exception:
+            info["mejor_cota"] = None
     if estado not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
 

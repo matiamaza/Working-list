@@ -830,7 +830,10 @@ class EstadoALNS:
             "candidatas_mejoran_makespan": 0, "candidatas_peores_aceptadas": 0,
             "_suma_delta": 0.0, "_n_delta": 0, "mejor_delta_makespan": None, "peor_delta_makespan": None,
         }
-        self.cp = {"ejecuciones": 0, "factibles": 0, "mejoran_incumbente": 0, "suma_aprox": 0.0, "suma_real": 0.0}
+        self.cp = {
+            "ejecuciones": 0, "factibles": 0, "mejoran_incumbente": 0, "suma_aprox": 0.0, "suma_real": 0.0,
+            "reconstruidas": 0, "dif_max": 0.0, "tiempo": 0.0,
+        }
     def mejor_solucion_factible(self):
         return self.inc.mejor
 
@@ -961,6 +964,7 @@ class EstadoALNS:
             self.estados_cpsat[estado_cp] += 1
             if reparador == "local_cp_sat_repair":
                 self.cp["ejecuciones"] += 1
+                self.cp["tiempo"] += time.monotonic() - inicio_iteracion
 
         s_d = self.estadisticas["destruccion"].get(destructor) or self.estadisticas["destruccion"].setdefault(
             destructor, _estadistica_vacia()
@@ -1115,11 +1119,13 @@ class EstadoALNS:
         d["peor_delta_makespan"] = delta if d["peor_delta_makespan"] is None else max(d["peor_delta_makespan"], delta)
 
     def _medir_cp(self, ms_aprox, ev, categoria):
+        self.cp["reconstruidas"] += 1
         if not ev["factible"]:
             return
         self.cp["factibles"] += 1
         self.cp["suma_aprox"] += ms_aprox
         self.cp["suma_real"] += ev["ms"]
+        self.cp["dif_max"] = max(self.cp["dif_max"], abs(ev["ms"] - ms_aprox))
         if categoria == "mejor":
             self.cp["mejoran_incumbente"] += 1
 
@@ -1136,12 +1142,17 @@ class EstadoALNS:
     def estadisticas_cp(self):
         c = self.cp
         f = c["factibles"]
+        e = c["ejecuciones"]
         return {
-            "ejecuciones": c["ejecuciones"], "factibles_tras_reconstruir": f,
+            "ejecuciones": e, "factibles_tras_reconstruir": f,
+            "estados": {k: self.estados_cpsat.get(k, 0) for k in ("OPTIMAL", "FEASIBLE", "INFEASIBLE", "UNKNOWN")},
+            "candidatas_reconstruidas": c["reconstruidas"],
             "mejoran_incumbente": c["mejoran_incumbente"],
             "ms_aproximado_promedio": c["suma_aprox"] / f if f else None,
             "ms_real_promedio": c["suma_real"] / f if f else None,
             "diferencia_promedio_min": (c["suma_real"] - c["suma_aprox"]) / f if f else None,
+            "diferencia_maxima_min": c["dif_max"] if f else None,
+            "tiempo_promedio_seg": c["tiempo"] / e if e else None,
         }
 
     def _reiniciar(self):

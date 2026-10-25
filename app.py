@@ -13,8 +13,10 @@ from interferencias import (
     comparar_cronogramas,
     construir_colas_trabajo,
     detectar_interferencias,
+    estado_solucion,
     orden_original_gruas,
     proponer_secuencia,
+    resumen_cp_local,
 )
 
 # --- 1. CONFIGURACIÓN INICIAL Y ESTILOS ---
@@ -1737,20 +1739,35 @@ def mostrar_resumen_optimizacion(propuesta, tiempo_total, interf_iniciales, inte
         return "—" if v is None else f"{v:.0f} min"
 
     final, semilla = a.get("makespan_final_min"), a.get("makespan_semilla_min")
+    primera = a.get("makespan_primera_factible_min")
+    interf_semilla = a.get("interferencias_semilla", interf_iniciales)
+    cruces_semilla = a.get("cruces_semilla")
+    semilla_factible = a.get("semilla_factible")
+    if semilla_factible is None:
+        semilla_factible = not interf_semilla and not cruces_semilla
     with st.expander("Resumen de la optimización", expanded=True):
-        st.write(f"Estado: {'✅ factible' if a.get('factible') else '❌ no factible'}")
+        st.write(f"Resultado: **{estado_solucion(a)}** · {'✅ factible' if a.get('factible') else '❌ no factible'}")
         filas = [
             ("Makespan de la semilla", mm("makespan_semilla_min")),
+            ("Estado de la semilla", "factible" if semilla_factible else "no factible"),
+            ("Interferencias / cruces iniciales", f"{interf_semilla} / {'—' if cruces_semilla is None else cruces_semilla}"),
             ("Primera solución factible", mm("makespan_primera_factible_min")),
             ("Antes del ALNS", mm("makespan_antes_alns_min")),
             ("Mejor candidata del ALNS", mm("makespan_mejor_candidata_alns_min")),
             ("Makespan final", mm("makespan_final_min")),
         ]
-        if final is not None and semilla:
-            filas.append(("Mejora respecto de la semilla", f"{semilla - final:+.0f} min ({(semilla - final) / semilla * 100:+.1f} %)"))
+        if semilla_factible:
+            if final is not None and semilla:
+                filas.append(("Mejora respecto de la semilla", f"{semilla - final:+.0f} min ({(semilla - final) / semilla * 100:+.1f} %)"))
+        elif primera is not None and semilla is not None:
+            filas.append(("Variación necesaria para alcanzar factibilidad", f"{primera - semilla:+.0f} min"))
+        if primera is not None and final is not None and primera:
+            filas.append((
+                "Mejora desde la primera solución factible",
+                f"{primera - final:+.0f} min ({(primera - final) / primera * 100:+.1f} %)",
+            ))
         filas += [
-            ("Interferencias iniciales → finales", f"{interf_iniciales} → {interf_finales}"),
-            ("Cruces finales", a.get("cruces_finales", "—")),
+            ("Interferencias / cruces finales", f"{interf_finales} / {a.get('cruces_finales', '—')}"),
             ("Movimientos conservados", "Sí" if a.get("movimientos_conservados") else "No"),
             ("Grúas disponibles / utilizadas", f"{a.get('gruas_disponibles', '—')} / {a.get('gruas_utilizadas', '—')}"),
             ("Iteraciones ALNS", a.get("iteraciones_alns", 0)),
@@ -1758,12 +1775,15 @@ def mostrar_resumen_optimizacion(propuesta, tiempo_total, interf_iniciales, inte
             ("Operador ganador", a.get("operador_destruccion_ganador") or "—"),
             ("Tiempo total", "—" if tiempo_total is None else f"{tiempo_total:.1f} s"),
         ]
+        cp = resumen_cp_local(a.get("estadisticas_cp_local"))
+        filas.append(("CP-SAT local", cp if isinstance(cp, str) else f"{cp['ejecuciones']} ejecuciones, {cp['mejoran_incumbente']} mejoran"))
         st.table(pd.DataFrame(filas, columns=["Indicador", "Valor"]).astype(str).set_index("Indicador"))
-        antes = a.get("makespan_antes_alns_min")
-        if a.get("iteraciones_alns") and antes is not None and final is not None and final >= antes - 1.0:
+        referencia = a.get("makespan_antes_alns_min")
+        if referencia is None:
+            referencia = primera
+        if a.get("iteraciones_alns") and referencia is not None and final is not None and final >= referencia - 1.0:
             st.info(
-                "El ALNS exploró alternativas factibles, pero no encontró una solución mejor que el incumbente "
-                "inicial dentro del tiempo disponible."
+                "El ALNS exploró alternativas factibles, pero no encontró una solución mejor dentro del tiempo disponible."
             )
 
 def mostrar_analisis_interferencias(
@@ -1807,18 +1827,38 @@ def mostrar_analisis_interferencias(
         usar_cp = c2.checkbox("Usar CP-SAT local", True, key="opt_cpsat_local")
         with st.expander("Configuración avanzada"):
             semilla_opt = st.number_input("Random seed", 0, 99999, 42, 1, key="opt_seed")
+            modo_repro = st.checkbox(
+                "Modo reproducible (1 worker)", False, key="opt_reproducible",
+                help="Usa un solo hilo y la misma semilla; el resultado puede variar levemente si cambia la carga del equipo, porque el tiempo límite es real.",
+            )
+            usar_inferido = st.checkbox(
+                "Usar orden físico inferido de la semilla", True, key="opt_orden_inferido",
+                help="Orden de grúas de proa a popa que se mantiene fijo para evitar cruces. No fija la primera tarea ni el primer bay.",
+            )
+            orden_fisico, error_orden = None, None
+            if not usar_inferido:
+                nombres_gruas = [g for g, _ in orden_gruas]
+                orden_fisico = st.multiselect(
+                    "Orden de las grúas de proa a popa", nombres_gruas, default=nombres_gruas, key="opt_orden_manual",
+                )
+                if sorted(orden_fisico) != sorted(nombres_gruas):
+                    error_orden = "Indique todas las grúas, cada una una sola vez."
+                    st.error(error_orden)
     params_opt = {
         "tiempo_limite": tiempo_opt, "random_seed": int(semilla_opt), "activar_alns": usar_alns,
         "permitir_reasignacion": permitir_reasig, "permitir_division": permitir_div, "usar_cpsat_local": usar_cp,
         "porcentaje_vecindad": base_metodo["porcentaje_vecindad"], "activar_mejora_local": True,
         "activar_mejora_local_inicial": True, "activar_intensificacion_final": usar_alns,
+        "modo_reproducible": modo_repro, "orden_fisico_gruas": orden_fisico if not usar_inferido else None,
     }
     if st.button("🔍 Analizar interferencias", type="primary", key="btn_analizar_interferencias"):
         resultado = {"firma": firma_actual, "holgura": holgura}
         resultado["interferencias"] = detectar_interferencias(df_cronograma, holgura)
         resultado["propuesta"] = None
         resultado["error"] = None
-        if not resultado["interferencias"].empty:
+        if not resultado["interferencias"].empty and error_orden:
+            resultado["error"] = error_orden
+        elif not resultado["interferencias"].empty:
             try:
                 with st.spinner(f"Optimizando la secuencia (puede tardar hasta ~{params_opt['tiempo_limite']} s)..."):
                     t_inicio_opt = time_module.monotonic()
