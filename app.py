@@ -8,6 +8,13 @@ import os
 import io
 import html
 from datetime import datetime, timedelta, time
+from interferencias import (
+    comparar_cronogramas,
+    construir_colas_trabajo,
+    detectar_interferencias,
+    orden_original_gruas,
+    proponer_secuencia,
+)
 
 # --- 1. CONFIGURACIÓN INICIAL Y ESTILOS ---
 st.set_page_config(page_title="Portal Operaciones SVTI", layout="wide", page_icon="⚓")
@@ -384,6 +391,21 @@ def estimar_turnos_necesarios(movimientos, inicio_dt, gmph_promedio=20, max_turn
             return indice
     return max_turnos
 
+def calcular_intervalo_tarea(params, inicio, movimientos, duracion_fija=None):
+    """Inicio efectivo, fin y minutos netos de una tarea, con las reglas de descansos y GMPH del cronograma."""
+    cursor = pd.Timestamp(inicio).to_pydatetime()
+    fin_descanso = _fin_descanso_actual(cursor)
+    while fin_descanso is not None:
+        cursor = fin_descanso
+        fin_descanso = _fin_descanso_actual(cursor)
+
+    schedule = params.get('gmph_schedule')
+    if duracion_fija is None and schedule:
+        return calcular_intervalo_con_gmph(cursor, movimientos, schedule)
+
+    duracion = duracion_fija if duracion_fija is not None else movimientos / params.get('gmph', 20) * 60
+    return cursor, calcular_fin_con_descansos(cursor, duracion), round(duracion, 1)
+
 def estimar_movimientos_por_grua(df):
     """Suma la cola por grúa, interpretando correctamente Total M acumulado."""
     resultados = {}
@@ -420,23 +442,73 @@ def configurar_gmph_por_grua(
     nombre_grua, gmph_default, minimo, maximo, clave_gmph, inicio_dt, movimientos_estimados
 ):
     """Muestra el GMPH constante o permite definirlo para cada uno de 9 turnos."""
-    usar_rangos = st.checkbox(
-        "Definir GMPH por turno",
+    horas_turno_efectivas = 6.83
+    usar_contenedores_turno = st.checkbox(
+        "Ingresar contenedores deseados por turno",
         value=False,
-        key=f"usar_rangos_gmph_{nombre_grua}"
+        key=f"usar_contenedores_turno_{clave_gmph}",
+        help=(
+            "Al activarlo, el rendimiento ingresado por grúa se interpreta como "
+            "contenedores por turno y se convierte usando 6,83 horas efectivas."
+        ),
+    )
+    factor_conversion = (
+        horas_turno_efectivas
+        if usar_contenedores_turno
+        else 1
+    )
+    unidad_clave = "contenedores_turno" if usar_contenedores_turno else "gmph"
+    minimo_ingresado = float(minimo) * factor_conversion
+    maximo_ingresado = float(maximo) * factor_conversion
+    paso_ingresado = 1.0 if factor_conversion != 1 else 0.1
+    etiqueta_rendimiento = (
+        "Contenedores deseados por turno" if usar_contenedores_turno else "GMPH"
+    )
+
+    def capturar_gmph(etiqueta, clave, valor_default=gmph_default):
+        valor_inicial = float(valor_default) * factor_conversion
+        if factor_conversion != 1:
+            valor_inicial = float(round(valor_inicial))
+        valor_ingresado = st.number_input(
+            etiqueta,
+            minimo_ingresado,
+            maximo_ingresado,
+            valor_inicial,
+            paso_ingresado,
+            key=clave,
+        )
+        return float(valor_ingresado) / factor_conversion
+
+    usar_rangos = st.checkbox(
+        "Definir rendimiento por turno",
+        value=False,
+        key=f"usar_rangos_gmph_{clave_gmph}"
     )
     if not usar_rangos:
-        gmph = st.number_input(
-            "GMPH", float(minimo), float(maximo), float(gmph_default), 0.1, key=clave_gmph
+        gmph = capturar_gmph(
+            etiqueta_rendimiento,
+            clave_gmph if factor_conversion == 1 else f"{clave_gmph}_{unidad_clave}",
+        )
+        st.caption(
+            f"Proyección calculada a {gmph:.2f} GMPH"
+            + (
+                f" desde {horas_turno_efectivas:.2f} horas efectivas por turno."
+                if usar_contenedores_turno else "."
+            )
         )
         return gmph, None
 
     turnos_estimados = estimar_turnos_necesarios(
         movimientos_estimados, inicio_dt, gmph_promedio=20
     )
+    rendimiento_referencia = 20 * factor_conversion
+    unidad_referencia = (
+        f"{rendimiento_referencia:.0f} contenedores por turno (20 GMPH)"
+        if usar_contenedores_turno else "20 GMPH"
+    )
     st.caption(
         f"Cola estimada: {movimientos_estimados:,.0f} movimientos. "
-        f"A 20 GMPH se proyectan {turnos_estimados} turno(s)."
+        f"A {unidad_referencia} se proyectan {turnos_estimados} turno(s)."
     )
     cantidad_turnos = st.number_input(
         "Turnos a configurar",
@@ -444,10 +516,14 @@ def configurar_gmph_por_grua(
         max_value=9,
         value=turnos_estimados,
         step=1,
-        key=f"cantidad_turnos_{nombre_grua}_{turnos_estimados}",
+        key=f"cantidad_turnos_{clave_gmph}_{turnos_estimados}",
         help="El valor inicial se estima con 20 movimientos por hora; se puede ajustar hasta 9.",
     )
-    st.caption("Cada turno puede tener un GMPH distinto; los descansos siguen excluidos.")
+    st.caption(
+        f"Ingresa el rendimiento en {etiqueta_rendimiento.lower()}; "
+        "se convierte a GMPH para la proyección. "
+        "Los descansos siguen excluidos."
+    )
     turnos = generar_turnos_trabajo(inicio_dt, cantidad=int(cantidad_turnos))
     columnas = st.columns(3)
     schedule = []
@@ -456,10 +532,14 @@ def configurar_gmph_por_grua(
             f"Turno {indice + 1} · {inicio_turno:%d/%m} "
             f"{inicio_turno:%H:%M}–{fin_turno:%H:%M}"
         )
-        gmph_turno = columnas[indice % 3].number_input(
-            etiqueta, float(minimo), float(maximo), float(gmph_default), 0.1,
-            key=f"gmph_turno_{nombre_grua}_{indice + 1}_{inicio_turno:%Y%m%d}"
-        )
+        clave_turno = f"gmph_turno_{clave_gmph}_{indice + 1}_{inicio_turno:%Y%m%d}"
+        if factor_conversion != 1:
+            clave_turno = f"{clave_turno}_{unidad_clave}"
+        with columnas[indice % 3]:
+            etiqueta_turno = f"{etiqueta} · {etiqueta_rendimiento}"
+            gmph_turno = capturar_gmph(etiqueta_turno, clave_turno)
+            if usar_contenedores_turno:
+                st.caption(f"Equivale a {gmph_turno:.2f} GMPH")
         schedule.append((inicio_turno, fin_turno, gmph_turno))
     return gmph_default, schedule
 
@@ -1559,6 +1639,199 @@ def agregar_buque_al_grafico(fig, lista_ordenada, estribor_muelle, alto_plot=ALT
                       fillcolor="rgba(160,160,160,0.35)", line=dict(color="rgba(190,190,190,0.7)", width=1),
                       layer="above")
 
+def construir_figura_gantt(
+    df_cronograma, mapa_colores, lista_ordenada, estribor_muelle,
+    intervalo_minutos, range_y_start, range_y_end,
+):
+    fig = go.Figure()
+
+    for categoria, color in mapa_colores.items():
+        df_cat = df_cronograma[df_cronograma['Categoría Visual'] == categoria]
+        if df_cat.empty: continue
+        for zona, df_zona in df_cat.groupby('Zona', dropna=False):
+            duracion_ms = (df_zona['Fin'] - df_zona['Inicio']).dt.total_seconds() * 1000
+            es_cubierta = zona == "Cubierta"
+            patron = {"shape": "/" if es_cubierta else ""}
+            if es_cubierta:
+                patron.update({
+                    "fgcolor": color,
+                    "bgcolor": GANTT_BG_COLOR,
+                    "solidity": 0.90,
+                })
+            fig.add_trace(go.Bar(
+                name=categoria,
+                x=df_zona['Bay Visual'], y=duracion_ms, base=df_zona['Inicio'],
+                orientation='v',
+                marker=dict(
+                    color=color,
+                    line=dict(color='black', width=1),
+                    pattern=patron,
+                ),
+                opacity=1.0, width=0.95,
+                customdata=df_zona[['Bay Real', 'Movimientos', 'Zona', 'Inicio', 'Fin', 'Duración Neta']],
+                hovertemplate=generar_hovertemplates_gantt(df_zona['Bay Real']),
+                showlegend=not es_cubierta,
+            ))
+
+    dias_unicos = pd.to_datetime(df_cronograma['Inicio']).dt.date.unique()
+    if not df_cronograma.empty:
+        ultimo_dia = df_cronograma['Fin'].max().date()
+        if ultimo_dia not in dias_unicos:
+            import numpy as np
+            dias_unicos = np.append(dias_unicos, ultimo_dia)
+
+    for dia in dias_unicos:
+        for h_ini, m_ini, h_fin, m_fin, label in BREAKS_CONFIG:
+            t_inicio = datetime.combine(dia, time(h_ini, m_ini))
+            t_fin = datetime.combine(dia, time(h_fin, m_fin))
+            fig.add_hrect(
+                y0=t_inicio, y1=t_fin, fillcolor="rgba(50, 50, 50, 1.0)", line_width=0, layer="above",
+                annotation_text=label, annotation_position="inside left",
+                annotation_y=t_inicio + (t_fin - t_inicio) / 2,
+                annotation_font_color="white", annotation_font_size=10
+            )
+
+    for dia in pd.date_range(range_y_start.date(), range_y_end.date(), freq="D").date:
+        for hora_hito in (time(6, 30), time(8, 0), time(15, 30), time(23, 0)):
+            fig.add_hline(
+                y=datetime.combine(dia, hora_hito),
+                line_color="white",
+                line_dash="solid",
+                line_width=1.5,
+            )
+
+    agregar_buque_al_grafico(fig, lista_ordenada, estribor_muelle)
+    # Traza invisible: obliga a Plotly a mostrar todas las columnas, incluso las sin datos
+    fig.add_trace(go.Scatter(x=lista_ordenada, y=[range_y_start] * len(lista_ordenada), mode="markers",
+                             marker=dict(opacity=0), showlegend=False, hoverinfo="skip"))
+    fig.update_layout(
+        height=900, legend=dict(orientation="h", yanchor="bottom", y=1 + 295 / ALTO_PLOT_GANTT, xanchor="right", x=1, font=dict(color='white'), bgcolor='rgba(0,0,0,0)'),
+        dragmode='pan', hovermode='closest', barmode='overlay', bargap=0.02,
+        plot_bgcolor=GANTT_BG_COLOR, paper_bgcolor=GANTT_BG_COLOR, font=dict(color='white'),
+        yaxis=dict(type='date', title="Hora", tickformat="%H:%M", tickfont=dict(color='white'), dtick=intervalo_minutos*60*1000, autorange="reversed", range=[range_y_start, range_y_end], gridcolor='#3a506b'),
+        xaxis=dict(title=None, type='category', categoryorder='array', categoryarray=lista_ordenada, side="top", tickfont=dict(color='white'), gridcolor='#000000', fixedrange=True),
+        margin=dict(l=60, r=20, t=900 - 20 - ALTO_PLOT_GANTT, b=20)
+    )
+    return fig
+
+def exportar_colas_excel(colas):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        for grua, cola in colas.items():
+            nombre_hoja = re.sub(r'[\[\]:*?/\\]', '_', f"Cola {grua}")[:31]
+            cola.to_excel(writer, sheet_name=nombre_hoja, index=False)
+    return buffer.getvalue()
+
+def mostrar_analisis_interferencias(
+    df_cronograma, config_gruas, mapa_colores, lista_ordenada, estribor_muelle,
+    intervalo_minutos, range_y_start, range_y_end, config_zoom,
+):
+    st.divider()
+    st.subheader("⚠️ Interferencias entre grúas")
+    holgura = st.number_input(
+        "Holgura de seguridad (min)", 0, 120, 15, 5, key="holgura_interferencias",
+        help=(
+            "Se alerta cuando dos grúas están en el mismo bay o en bays contiguos y sus tareas "
+            "coinciden o quedan separadas por menos que esta holgura. Cubierta y bodega cuentan como el mismo bay."
+        ),
+    )
+    firma_actual = hash((
+        repr(sorted((g, repr(c)) for g, c in config_gruas.items())),
+        df_cronograma[["Grúa", "Bay Real", "Acción", "Inicio", "Fin"]].to_json(),
+    ))
+    orden_gruas = sorted(orden_original_gruas(df_cronograma).items(), key=lambda par: par[1])
+    st.caption(
+        "Orden de grúas de proa a popa (según el bay de su primera tarea): "
+        + " → ".join(grua for grua, _ in orden_gruas)
+        + ". La propuesta nunca invierte este orden y mantiene al menos 8 bays visuales entre grúas que trabajan a la vez."
+    )
+    st.caption("Configura primero los turnos y rendimientos de cada grúa; luego presiona el botón para analizar.")
+    if st.button("🔍 Analizar interferencias", type="primary", key="btn_analizar_interferencias"):
+        resultado = {"firma": firma_actual, "holgura": holgura}
+        resultado["interferencias"] = detectar_interferencias(df_cronograma, holgura)
+        resultado["propuesta"] = None
+        resultado["error"] = None
+        if not resultado["interferencias"].empty:
+            try:
+                with st.spinner("Optimizando la secuencia (puede tardar hasta ~20 s)..."):
+                    resultado["propuesta"] = proponer_secuencia(
+                        df_cronograma, config_gruas, calcular_intervalo_tarea, holgura
+                    )
+            except ValueError as e:
+                resultado["error"] = str(e)
+        st.session_state["analisis_interferencias"] = resultado
+
+    resultado = st.session_state.get("analisis_interferencias")
+    if resultado is None:
+        return
+    if resultado["firma"] != firma_actual:
+        st.warning(
+            "Los resultados están desactualizados: cambió la configuración de las grúas "
+            "(turnos, rendimientos, inicio o nombres). Presiona «Analizar interferencias» para actualizarlos."
+        )
+    holgura = resultado["holgura"]
+    interferencias = resultado["interferencias"]
+    if interferencias.empty:
+        st.success(f"No hay grúas en el mismo bay ni en bays contiguos dentro de la holgura de {holgura} min.")
+        return
+
+    st.warning(f"Se detectaron {len(interferencias)} posible(s) interferencia(s) entre grúas.")
+    tabla_interferencias = interferencias.assign(
+        Desde=interferencias["Desde"].dt.strftime("%d/%m %H:%M"),
+        Hasta=interferencias["Hasta"].dt.strftime("%d/%m %H:%M"),
+    )
+    st.dataframe(tabla_interferencias, use_container_width=True, hide_index=True)
+
+    st.subheader("🔁 Propuesta sugerida")
+    if resultado["error"]:
+        st.error(resultado["error"])
+        return
+    propuesta = resultado["propuesta"]
+
+    restantes = len(detectar_interferencias(propuesta, holgura))
+    comparacion = comparar_cronogramas(df_cronograma, propuesta)
+    variacion_total = comparacion["Variación (min)"].iloc[-1]
+    if restantes:
+        st.warning(f"La propuesta aún tiene {restantes} interferencia(s) que no pudo resolver.")
+    else:
+        st.success("La propuesta no deja grúas en el mismo bay ni en bays contiguos dentro de la holgura.")
+    if variacion_total and variacion_total > 0:
+        st.info(f"Para evitar las interferencias, la operación completa termina {variacion_total:.0f} min después.")
+    elif variacion_total is not None and variacion_total <= 0:
+        st.info(f"La operación completa termina {abs(variacion_total):.0f} min antes o a la misma hora.")
+    st.dataframe(comparacion, use_container_width=True, hide_index=True)
+    if propuesta.attrs.get("metodo"):
+        st.caption(f"Método elegido: {propuesta.attrs['metodo']}")
+    st.caption(
+        "La propuesta puede mover y partir tareas entre grúas, respetando el orden original dentro de cada bay "
+        "(descarga antes que embarque, cubierta antes que bodega) y los pontones en su grúa. "
+        "Las grúas no se cruzan: conservan el orden de bays que tenían al inicio del plan original "
+        "        y, mientras trabajan, quedan al menos 8 bays visuales separadas; una grúa que espera, se desplaza o ya terminó no restringe a las demás. "
+                "La propuesta puede rehacer la secuencia desde cero y se elige, entre varios métodos "
+                "(incluida una optimización CP-SAT que minimiza el término de la operación), la que termina antes. "
+        "No considera el tipo de grúa (STS/MHC) ni restricciones de estiba."
+    )
+
+    inicio_propuesta = min(range_y_start, propuesta["Inicio"].min() - timedelta(minutes=30))
+    fin_propuesta = max(range_y_end, propuesta["Fin"].max() + timedelta(minutes=30))
+    figura_propuesta = construir_figura_gantt(
+        propuesta, mapa_colores, lista_ordenada, estribor_muelle,
+        intervalo_minutos, inicio_propuesta, fin_propuesta,
+    )
+    st.plotly_chart(figura_propuesta, use_container_width=True, config=config_zoom, key="gantt_propuesta")
+
+    st.subheader("📋 Cola de trabajo por grúa (propuesta)")
+    colas = construir_colas_trabajo(propuesta)
+    for grua, cola in colas.items():
+        with st.expander(f"{grua} · {len(cola)} tarea(s) · {int(cola['Movimientos'].sum())} movimientos"):
+            st.dataframe(cola, use_container_width=True, hide_index=True)
+    st.download_button(
+        "📥 Descargar colas de trabajo (Excel)",
+        data=exportar_colas_excel(colas),
+        file_name="Colas_trabajo_propuesta.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
 def render_simulador():
     st.title("🏗️ Simulador de Planificación Naviera - SVTI")
     
@@ -1625,6 +1898,10 @@ def render_simulador():
             if len(set(renombres.values())) < len(renombres):
                 st.error("Hay grúas con el mismo nombre; asigna un nombre distinto a cada una.")
                 st.stop()
+            colores_por_nombre_grua = {
+                renombres[grua]: colores_config_gruas[grua]
+                for grua in lista_gruas
+            }
             df_raw = df_raw.assign(**{"Grúa": df_raw["Grúa"].map(renombres)})
             config_gruas = {renombres[g]: c for g, c in config_gruas.items()}
             lista_gruas = sorted(renombres.values())
@@ -1671,10 +1948,8 @@ def render_simulador():
                         f"{sin_zona} tarea(s) no tienen una zona identificable en el texto extraído. "
                         "Se muestran sólidas; confirma que el PDF incluya una etiqueta como DECK/CUBIERTA o HOLD/BODEGA."
                     )
-                
                 mapa_colores = { "Pontón": "#7F8C8D", "Otro": "#BDC3C7" }
-                colores_por_grua = obtener_colores_gruas(lista_gruas)
-                for nombre_g, (color_desc, color_emb) in colores_por_grua.items():
+                for nombre_g, (color_desc, color_emb) in colores_por_nombre_grua.items():
                     mapa_colores[f"{nombre_g} - Descarga"] = color_desc
                     mapa_colores[f"{nombre_g} - Embarque"] = color_emb
 
@@ -1693,78 +1968,17 @@ def render_simulador():
                 range_y_start = inicio_min - timedelta(minutes=30)
                 range_y_end = fin_max + timedelta(minutes=30)
 
-                fig = go.Figure()
-
-                for categoria, color in mapa_colores.items():
-                    df_cat = df_cronograma[df_cronograma['Categoría Visual'] == categoria]
-                    if df_cat.empty: continue
-                    for zona, df_zona in df_cat.groupby('Zona', dropna=False):
-                        duracion_ms = (df_zona['Fin'] - df_zona['Inicio']).dt.total_seconds() * 1000
-                        es_cubierta = zona == "Cubierta"
-                        patron = {"shape": "/" if es_cubierta else ""}
-                        if es_cubierta:
-                            patron.update({
-                                "fgcolor": color,
-                                "bgcolor": GANTT_BG_COLOR,
-                                "solidity": 0.90,
-                            })
-                        fig.add_trace(go.Bar(
-                            name=categoria,
-                            x=df_zona['Bay Visual'], y=duracion_ms, base=df_zona['Inicio'],
-                            orientation='v',
-                            marker=dict(
-                                color=color,
-                                line=dict(color='black', width=1),
-                                pattern=patron,
-                            ),
-                            opacity=1.0, width=0.95,
-                            customdata=df_zona[['Bay Real', 'Movimientos', 'Zona', 'Inicio', 'Fin', 'Duración Neta']],
-                            hovertemplate=generar_hovertemplates_gantt(df_zona['Bay Real']),
-                            showlegend=not es_cubierta,
-                        ))
-
-                dias_unicos = pd.to_datetime(df_cronograma['Inicio']).dt.date.unique()
-                if not df_cronograma.empty:
-                    ultimo_dia = df_cronograma['Fin'].max().date()
-                    if ultimo_dia not in dias_unicos:
-                        import numpy as np
-                        dias_unicos = np.append(dias_unicos, ultimo_dia)
-
-                for dia in dias_unicos:
-                    for h_ini, m_ini, h_fin, m_fin, label in BREAKS_CONFIG:
-                        t_inicio = datetime.combine(dia, time(h_ini, m_ini))
-                        t_fin = datetime.combine(dia, time(h_fin, m_fin))
-                        fig.add_hrect(
-                            y0=t_inicio, y1=t_fin, fillcolor="rgba(50, 50, 50, 1.0)", line_width=0, layer="above",
-                            annotation_text=label, annotation_position="inside left",
-                            annotation_y=t_inicio + (t_fin - t_inicio) / 2,
-                            annotation_font_color="white", annotation_font_size=10
-                        )
-
-                for dia in pd.date_range(range_y_start.date(), range_y_end.date(), freq="D").date:
-                    for hora_hito in (time(6, 30), time(8, 0), time(15, 30), time(23, 0)):
-                        fig.add_hline(
-                            y=datetime.combine(dia, hora_hito),
-                            line_color="white",
-                            line_dash="solid",
-                            line_width=1.5,
-                        )
-
-                agregar_buque_al_grafico(fig, lista_ordenada, estribor_muelle)
-                # Traza invisible: obliga a Plotly a mostrar todas las columnas, incluso las sin datos
-                fig.add_trace(go.Scatter(x=lista_ordenada, y=[range_y_start] * len(lista_ordenada), mode="markers",
-                                         marker=dict(opacity=0), showlegend=False, hoverinfo="skip"))
-                fig.update_layout(
-                    height=900, legend=dict(orientation="h", yanchor="bottom", y=1 + 295 / ALTO_PLOT_GANTT, xanchor="right", x=1, font=dict(color='white'), bgcolor='rgba(0,0,0,0)'),
-                    dragmode='pan', hovermode='closest', barmode='overlay', bargap=0.02,
-                    plot_bgcolor=GANTT_BG_COLOR, paper_bgcolor=GANTT_BG_COLOR, font=dict(color='white'),
-                    yaxis=dict(type='date', title="Hora", tickformat="%H:%M", tickfont=dict(color='white'), dtick=intervalo_minutos*60*1000, autorange="reversed", range=[range_y_start, range_y_end], gridcolor='#3a506b'),
-                    xaxis=dict(title=None, type='category', categoryorder='array', categoryarray=lista_ordenada, side="top", tickfont=dict(color='white'), gridcolor='#000000', fixedrange=True),
-                    margin=dict(l=60, r=20, t=900 - 20 - ALTO_PLOT_GANTT, b=20)
+                fig = construir_figura_gantt(
+                    df_cronograma, mapa_colores, lista_ordenada, estribor_muelle,
+                    intervalo_minutos, range_y_start, range_y_end,
                 )
-                
                 config_zoom = {'scrollZoom': True, 'displayModeBar': True, 'modeBarButtonsToRemove': ['select2d', 'lasso2d']}
                 st.plotly_chart(fig, use_container_width=True, config=config_zoom)
+
+                mostrar_analisis_interferencias(
+                    df_cronograma, config_gruas, mapa_colores, lista_ordenada, estribor_muelle,
+                    intervalo_minutos, range_y_start, range_y_end, config_zoom,
+                )
 
                 st.subheader("TENTATIVE WORKING PROGRAM")
                 tabla_programa, resumen_programa = construir_programa_trabajo(df_cronograma)
@@ -1915,7 +2129,3 @@ if st.session_state.page == 'home': render_menu()
 elif st.session_state.page == 'simulador': render_simulador()
 elif st.session_state.page == 'planificador_sts': render_planificador_sts()
 elif st.session_state.page == 'operacion': render_operacion()
-
-
-
-
