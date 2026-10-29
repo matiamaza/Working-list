@@ -14,7 +14,11 @@ from interferencias import (
     construir_colas_trabajo,
     detectar_interferencias,
     estado_solucion,
+    gruas_en_ventana,
+    calcular_makespan_min,
+    contar_traslados,
     orden_original_gruas,
+    proponer_minimas_cuadrillas,
     proponer_secuencia,
     resumen_cp_local,
 )
@@ -709,7 +713,7 @@ def construir_tabla_turnos_trabajados(df_cronograma):
         for f in calcular_turnos_con_gruas(df_cronograma)
     ])
 
-def generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque, alias_gruas=None):
+def generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque, alias_gruas=None, encabezado=None, tabla_turnos_editada=None):
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
@@ -732,7 +736,20 @@ def generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque, alias_gruas
     gruas = list(tabla_programa.columns[1:-1])
     fila = lambda op: tabla_programa[tabla_programa["Operation"] == op].iloc[0]
     desc, emb, tot = fila("Discharge"), fila("Load"), fila("Total")
-    total_movs = int(tot["Total"])
+
+    def entero(valor):
+        numero = pd.to_numeric(valor, errors="coerce")
+        return 0 if pd.isna(numero) else int(numero)
+
+    total_movs = entero(tot["Total"])
+    enc = encabezado.iloc[0] if encabezado is not None and len(encabezado) else None
+    if enc is not None:
+        horas_txt = f"{enc['Rendimiento (mov/h)']} mov/h"
+        densidad_txt = str(enc["Crane density"])
+        descarga_kpi, embarque_kpi = entero(enc["Discharge"]), entero(enc["Loading"])
+    else:
+        horas_txt, densidad_txt = f"{total_movs / horas:.0f} mov/h", f"{horas_grua / horas:.2f}"
+        descarga_kpi, embarque_kpi = entero(desc["Total"]), entero(emb["Total"])
 
     def kpi(titulo, valor):
         t = Table([[titulo], [valor]], colWidths=[3.3 * cm], rowHeights=[0.7 * cm, 1.1 * cm])
@@ -756,13 +773,13 @@ def generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque, alias_gruas
         Paragraph(f"Fecha de operación: {inicio:%d/%m/%Y}", est_sub),
         Spacer(1, 0.5 * cm),
         Paragraph("MOVIMIENTOS", est_sec), Spacer(1, 0.2 * cm),
-        fila_kpi([("MOVIMIENTOS TOTALES", f"{total_movs:,}"), ("DESCARGA", f"{int(desc['Total']):,}"),
-                  ("EMBARQUE", f"{int(emb['Total']):,}"), ("GRÚAS", str(len(gruas)))]),
+        fila_kpi([("MOVIMIENTOS TOTALES", f"{total_movs:,}"),         ("DESCARGA", f"{descarga_kpi:,}"),
+                          ("EMBARQUE", f"{embarque_kpi:,}"), ("GRÚAS", str(len(gruas)))]),
         Spacer(1, 0.5 * cm),
         Paragraph("VENTANA OPERACIONAL", est_sec), Spacer(1, 0.2 * cm),
         fila_kpi([("INICIO", f"{inicio:%d/%m %H:%M}"), ("TÉRMINO EST.", f"{fin:%d/%m %H:%M}"),
-                  ("DURACIÓN", f"{horas:.1f} h"), ("PRODUCTIVIDAD", f"{total_movs / horas:.0f} mov/h"),
-                  ("CRANE DENSITY", f"{horas_grua / horas:.2f}")]),
+                  ("DURACIÓN", f"{horas:.1f} h"),                   ("PRODUCTIVIDAD", horas_txt),
+                                    ("CRANE DENSITY", densidad_txt)]),
         Spacer(1, 0.5 * cm),
         Paragraph("DISTRIBUCIÓN POR GRÚA", est_sec), Spacer(1, 0.2 * cm),
     ]
@@ -774,10 +791,10 @@ def generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque, alias_gruas
             df_cronograma.loc[df_cronograma["Grúa"].astype(str).eq(str(original)), "Bay Visual"], errors="coerce"
         ).dropna()
         rango = f"{int(bays.min()):02d}-{int(bays.max()):02d}" if not bays.empty else "-"
-        total_g = int(tot[g])
-        filas.append([g, tipo_grua(original), rango, int(desc[g]), int(emb[g]), total_g,
+        total_g = entero(tot[g])
+        filas.append([g, tipo_grua(original), rango, entero(desc[g]), entero(emb[g]), total_g,
                       f"{(total_g / total_movs * 100) if total_movs else 0:.1f}%"])
-    filas.append(["TOTAL", "", "", int(desc["Total"]), int(emb["Total"]), total_movs, "100.0%"])
+    filas.append(["TOTAL", "", "", entero(desc["Total"]), entero(emb["Total"]), total_movs, "100.0%"])
 
     tabla = Table(filas, repeatRows=1, colWidths=[2.6 * cm, 1.8 * cm, 2.6 * cm, 2.4 * cm, 2.4 * cm, 2.2 * cm, 3 * cm])
     tabla.setStyle(TableStyle([
@@ -793,7 +810,7 @@ def generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque, alias_gruas
     dibujo = Drawing(16 * cm, 7 * cm)
     grafico = VerticalBarChart()
     grafico.x, grafico.y, grafico.width, grafico.height = 40, 30, 16 * cm - 60, 7 * cm - 50
-    grafico.data = [[int(desc[g]) for g in gruas], [int(emb[g]) for g in gruas]]
+    grafico.data = [[entero(desc[g]) for g in gruas], [entero(emb[g]) for g in gruas]]
     grafico.categoryAxis.categoryNames = [str(g) for g in gruas]
     grafico.bars[0].fillColor, grafico.bars[1].fillColor = azul, colors.HexColor("#E08A1E")
     grafico.valueAxis.valueMin = 0
@@ -802,14 +819,23 @@ def generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque, alias_gruas
     elementos += [dibujo, Paragraph("Azul: descarga | Naranja: embarque", est_sub), Spacer(1, 0.5 * cm),
                   Paragraph("CUADRILLAS POR TURNO DE TRABAJO", est_sec), Spacer(1, 0.2 * cm)]
 
-    filas_turnos = [["Turno", "Cuadrillas", "STS", "MHC", "Detalle"]]
-    for f in calcular_turnos_con_gruas(df_cronograma):
-        filas_turnos.append([f"Turno {f['turno']}", f["STS"] + f["MHC"] + f["Otra"], f["STS"], f["MHC"],
-                             descripcion_cuadrillas(f)])
-    tabla_turnos = Table(filas_turnos, repeatRows=1, colWidths=[2.4 * cm, 2.4 * cm, 1.8 * cm, 1.8 * cm, 8.6 * cm])
+    estilo_celda = ParagraphStyle("c", fontSize=9, leading=11)
+    if tabla_turnos_editada is not None:
+        filas_turnos = [["Turno", "Detalle"]] + [
+            [Paragraph(html.escape("" if pd.isna(v) else str(v)), estilo_celda) for v in (f.iloc[0], f.iloc[1])]
+            for _, f in tabla_turnos_editada.iterrows()
+        ]
+        anchos = [4 * cm, 13 * cm]
+    else:
+        filas_turnos = [["Turno", "Cuadrillas", "STS", "MHC", "Detalle"]]
+        for f in calcular_turnos_con_gruas(df_cronograma):
+            filas_turnos.append([f"Turno {f['turno']}", f["STS"] + f["MHC"] + f["Otra"], f["STS"], f["MHC"],
+                                 descripcion_cuadrillas(f)])
+        anchos = [2.4 * cm, 2.4 * cm, 1.8 * cm, 1.8 * cm, 8.6 * cm]
+    tabla_turnos = Table(filas_turnos, repeatRows=1, colWidths=anchos)
     tabla_turnos.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), azul), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("ALIGN", (1, 0), (3, -1), "CENTER"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("ALIGN", (1, 0), (3, -1), "CENTER" if len(anchos) > 2 else "LEFT"),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, gris]),
         ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("FONTSIZE", (0, 0), (-1, -1), 9),
     ]))
@@ -1786,6 +1812,69 @@ def mostrar_resumen_optimizacion(propuesta, tiempo_total, interf_iniciales, inte
                 "El ALNS exploró alternativas factibles, pero no encontró una solución mejor dentro del tiempo disponible."
             )
 
+def firma_cronograma(df_cronograma, config_gruas):
+    return hash((
+        repr(sorted((g, repr(c)) for g, c in config_gruas.items())),
+        df_cronograma[["Grúa", "Bay Real", "Acción", "Inicio", "Fin"]].to_json(),
+    ))
+
+def mostrar_opciones_secuencia(
+    alternativas, clave, mapa_colores, lista_ordenada, estribor_muelle, intervalo_minutos,
+    range_y_start, range_y_end, config_zoom, ventana=None,
+):
+    """Una pestaña por alternativa (mejor primero) con su Gantt, resumen y colas de trabajo por grúa."""
+    nombres = [
+        "Opción 1 ⭐ (sin penalización)" if i == 1 else f"Opción {i} (penaliza traslados)"
+        for i in range(1, len(alternativas) + 1)
+    ]
+    if len(alternativas) > 1:
+        st.caption(
+            "La Opción 1 minimiza el término sin penalizar. Las demás son las mejores secuencias distintas "
+            "al penalizar suavemente los traslados entre bays (penalización ficticia, solo para ordenar; "
+            "los horarios mostrados son reales)."
+        )
+    for i, (pestana, alt) in enumerate(zip(st.tabs(nombres), alternativas), start=1):
+        df = alt["df"]
+        with pestana:
+            fila = {
+                "Término (ETC)": f"{pd.to_datetime(df['Fin']).max():%d/%m %H:%M}",
+                "Makespan (min)": round(alt["makespan_min"]),
+                "Traslados de bay": alt.get("traslados", contar_traslados(df)),
+                "Tareas reasignadas": alt["reasignadas"],
+                "Fragmentos extra": alt["fragmentos"],
+            }
+            if alt.get("makespan_penalizado_min") is not None:
+                fila["Makespan penalizado (min)"] = round(alt["makespan_penalizado_min"])
+            if ventana is not None:
+                gruas = gruas_en_ventana(df, ventana)
+                fila["Cuadrillas último turno"] = len(gruas)
+                fila["Grúas último turno"] = ", ".join(gruas)
+            st.dataframe(pd.DataFrame([fila]), use_container_width=True, hide_index=True)
+            inicio_g = min(range_y_start, df["Inicio"].min() - timedelta(minutes=30))
+            fin_g = max(range_y_end, df["Fin"].max() + timedelta(minutes=30))
+            figura = construir_figura_gantt(
+                df, mapa_colores, lista_ordenada, estribor_muelle, intervalo_minutos, inicio_g, fin_g,
+            )
+            st.plotly_chart(figura, use_container_width=True, config=config_zoom, key=f"gantt_{clave}_{i}")
+            colas = construir_colas_trabajo(df)
+            for grua, cola in colas.items():
+                with st.expander(f"{grua} · {len(cola)} tarea(s) · {int(cola['Movimientos'].sum())} movimientos"):
+                    st.dataframe(cola, use_container_width=True, hide_index=True)
+            st.download_button(
+                "📥 Descargar colas de trabajo (Excel)",
+                data=exportar_colas_excel(colas),
+                file_name=f"Colas_trabajo_{clave}_opcion{i}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"descarga_{clave}_{i}",
+            )
+
+
+def _alternativas_de(df):
+    return df.attrs.get("alternativas") or [{
+        "df": df, "makespan_min": calcular_makespan_min(df), "reasignadas": 0, "fragmentos": 0,
+    }]
+
+
 def mostrar_analisis_interferencias(
     df_cronograma, config_gruas, mapa_colores, lista_ordenada, estribor_muelle,
     intervalo_minutos, range_y_start, range_y_end, config_zoom,
@@ -1799,10 +1888,7 @@ def mostrar_analisis_interferencias(
             "coinciden o quedan separadas por menos que esta holgura. Cubierta y bodega cuentan como el mismo bay."
         ),
     )
-    firma_actual = hash((
-        repr(sorted((g, repr(c)) for g, c in config_gruas.items())),
-        df_cronograma[["Grúa", "Bay Real", "Acción", "Inicio", "Fin"]].to_json(),
-    ))
+    firma_actual = firma_cronograma(df_cronograma, config_gruas)
     orden_gruas = sorted(orden_original_gruas(df_cronograma).items(), key=lambda par: par[1])
     st.caption(
         "Orden de grúas de proa a popa (según el bay de su primera tarea): "
@@ -1825,6 +1911,11 @@ def mostrar_analisis_interferencias(
         permitir_div = c2.checkbox("Permitir división", True, key="opt_division")
         usar_alns = c2.checkbox("Activar ALNS", base_metodo["activar_alns"], key=f"opt_alns_{metodo_opt}")
         usar_cp = c2.checkbox("Usar CP-SAT local", True, key="opt_cpsat_local")
+        penal_traslado = c1.number_input(
+            "Penalización por traslado de bay (min)", 0.0, 60.0, 5.0, 1.0, key="opt_penal_traslado",
+            help="Costo ficticio por cada cambio de bay de una grúa. Solo sirve para comparar y ordenar "
+                 "secuencias (opciones 2 y 3); no aparece en los horarios. 0 la desactiva.",
+        )
         with st.expander("Configuración avanzada"):
             semilla_opt = st.number_input("Random seed", 0, 99999, 42, 1, key="opt_seed")
             modo_repro = st.checkbox(
@@ -1850,7 +1941,9 @@ def mostrar_analisis_interferencias(
         "porcentaje_vecindad": base_metodo["porcentaje_vecindad"], "activar_mejora_local": True,
         "activar_mejora_local_inicial": True, "activar_intensificacion_final": usar_alns,
         "modo_reproducible": modo_repro, "orden_fisico_gruas": orden_fisico if not usar_inferido else None,
+        "penalizacion_traslado_min": float(penal_traslado),
     }
+    st.session_state["params_opt_vigentes"] = params_opt
     if st.button("🔍 Analizar interferencias", type="primary", key="btn_analizar_interferencias"):
         resultado = {"firma": firma_actual, "holgura": holgura}
         resultado["interferencias"] = detectar_interferencias(df_cronograma, holgura)
@@ -1922,24 +2015,108 @@ def mostrar_analisis_interferencias(
         "No considera el tipo de grúa (STS/MHC) ni restricciones de estiba."
     )
 
-    inicio_propuesta = min(range_y_start, propuesta["Inicio"].min() - timedelta(minutes=30))
-    fin_propuesta = max(range_y_end, propuesta["Fin"].max() + timedelta(minutes=30))
-    figura_propuesta = construir_figura_gantt(
-        propuesta, mapa_colores, lista_ordenada, estribor_muelle,
-        intervalo_minutos, inicio_propuesta, fin_propuesta,
+    st.subheader("📊 Mejores secuencias (mínimo makespan)")
+    mostrar_opciones_secuencia(
+        _alternativas_de(propuesta), "propuesta", mapa_colores, lista_ordenada, estribor_muelle,
+        intervalo_minutos, range_y_start, range_y_end, config_zoom,
     )
-    st.plotly_chart(figura_propuesta, use_container_width=True, config=config_zoom, key="gantt_propuesta")
 
-    st.subheader("📋 Cola de trabajo por grúa (propuesta)")
-    colas = construir_colas_trabajo(propuesta)
-    for grua, cola in colas.items():
-        with st.expander(f"{grua} · {len(cola)} tarea(s) · {int(cola['Movimientos'].sum())} movimientos"):
-            st.dataframe(cola, use_container_width=True, hide_index=True)
-    st.download_button(
-        "📥 Descargar colas de trabajo (Excel)",
-        data=exportar_colas_excel(colas),
-        file_name="Colas_trabajo_propuesta.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+def mostrar_minimas_cuadrillas(
+    df_cronograma, config_gruas, mapa_colores, lista_ordenada, estribor_muelle,
+    intervalo_minutos, range_y_start, range_y_end, config_zoom,
+):
+    st.divider()
+    st.subheader("👥 Mínimas cuadrillas en el último turno")
+    st.caption(
+        "Segunda secuencia: parte de la de mínimo makespan y, en el turno donde termina la operación, concentra "
+        "el trabajo restante en la menor cantidad de grúas posible, privilegiando STS, sin pasar del término de "
+        "ese turno y respetando precedencias, orden de grúas y separación de bays."
+    )
+    firma_actual = firma_cronograma(df_cronograma, config_gruas)
+    holgura = st.session_state.get("holgura_interferencias", 15)
+    params = st.session_state.get("params_opt_vigentes") or {"tiempo_limite": 20}
+
+    if st.button("👥 Calcular mínimas cuadrillas", type="primary", key="btn_minimas_cuadrillas"):
+        analisis = st.session_state.get("analisis_interferencias")
+        vigente = (
+            analisis is not None and analisis["firma"] == firma_actual
+            and analisis["holgura"] == holgura and not analisis["error"]
+        )
+        resultado = {"firma": firma_actual, "error": None, "base": None, "propuesta": None}
+        try:
+            with st.spinner("Calculando la secuencia de mínimas cuadrillas..."):
+                t_inicio = time_module.monotonic()
+                if vigente and analisis["propuesta"] is not None:
+                    resultado["base"] = analisis["propuesta"]
+                elif vigente and analisis["interferencias"].empty:
+                    resultado["base"] = df_cronograma
+                else:
+                    resultado["base"] = proponer_secuencia(
+                        df_cronograma, config_gruas, calcular_intervalo_tarea, holgura, **params
+                    )
+                resultado["propuesta"] = proponer_minimas_cuadrillas(
+                    df_cronograma, resultado["base"], config_gruas, calcular_intervalo_tarea, holgura, tipo_grua,
+                    tiempo_limite=params["tiempo_limite"],
+                    orden_fisico_gruas=params.get("orden_fisico_gruas"),
+                    penalizacion_traslado_min=params.get("penalizacion_traslado_min", 5.0),
+                )
+                resultado["tiempo_total"] = time_module.monotonic() - t_inicio
+        except ValueError as e:
+            resultado["error"] = str(e)
+        st.session_state["minimas_cuadrillas"] = resultado
+
+    resultado = st.session_state.get("minimas_cuadrillas")
+    if resultado is None:
+        return
+    if resultado["firma"] != firma_actual:
+        st.warning(
+            "Los resultados están desactualizados: cambió la configuración de las grúas. "
+            "Presiona «Calcular mínimas cuadrillas» para actualizarlos."
+        )
+    if resultado["error"]:
+        st.error(resultado["error"])
+        return
+
+    base, minima = resultado["base"], resultado["propuesta"]
+    ventana = minima.attrs["ventana_turno"]
+    ahorradas = minima.attrs["cuadrillas_ahorradas"]
+    if ahorradas > 0:
+        st.success(
+            f"Se ahorra{'n' if ahorradas > 1 else ''} {ahorradas} cuadrilla{'s' if ahorradas > 1 else ''} en el turno "
+            f"{ventana[0]:%H:%M}-{ventana[1]:%H:%M}: grúas {', '.join(minima.attrs['gruas_turno_final'])}."
+        )
+    else:
+        st.info("No fue posible ahorrar cuadrillas en el último turno sin pasar de su término; se mantiene la secuencia base.")
+    if minima.attrs.get("tiempo_agotado") and ahorradas == 0:
+        st.caption("La búsqueda se detuvo por el tiempo límite; aumentarlo en «Configuración de optimización» puede ayudar.")
+
+    def fila_resumen(nombre, df):
+        gruas = gruas_en_ventana(df, ventana)
+        tipos = [tipo_grua(g) for g in gruas]
+        return {
+            "Secuencia": nombre,
+            "Término (ETC)": f"{pd.to_datetime(df['Fin']).max():%d/%m %H:%M}",
+            "Makespan (min)": round(calcular_makespan_min(df)),
+            "Cuadrillas último turno": len(gruas),
+            "STS": tipos.count("STS"), "MHC": tipos.count("MHC"),
+            "Grúas": ", ".join(gruas),
+        }
+
+    st.dataframe(
+        pd.DataFrame([fila_resumen("Mínimo makespan", base), fila_resumen("Mínimas cuadrillas", minima)]),
+        use_container_width=True, hide_index=True,
+    )
+
+    opciones = ["Mínimo makespan", "Mínimas cuadrillas"]
+    elegida = st.segmented_control(
+        "Secuencia en el Gantt", opciones, default=opciones[1], key="sel_secuencia_minimas",
+    ) or opciones[1]
+    secuencia = minima if elegida == opciones[1] else base
+
+    mostrar_opciones_secuencia(
+        _alternativas_de(secuencia), "minimas" if secuencia is minima else "base_minimas", mapa_colores,
+        lista_ordenada, estribor_muelle, intervalo_minutos, range_y_start, range_y_end, config_zoom,
+        ventana=ventana,
     )
 
 def render_simulador():
@@ -2089,6 +2266,10 @@ def render_simulador():
                     df_cronograma, config_gruas, mapa_colores, lista_ordenada, estribor_muelle,
                     intervalo_minutos, range_y_start, range_y_end, config_zoom,
                 )
+                mostrar_minimas_cuadrillas(
+                    df_cronograma, config_gruas, mapa_colores, lista_ordenada, estribor_muelle,
+                    intervalo_minutos, range_y_start, range_y_end, config_zoom,
+                )
 
                 st.subheader("TENTATIVE WORKING PROGRAM")
                 tabla_programa, resumen_programa = construir_programa_trabajo(df_cronograma)
@@ -2106,17 +2287,42 @@ def render_simulador():
                     "Rendimiento (mov/h)": f"{total_programa / horas_op:.0f}",
                     "Crane density": f"{horas_grua / horas_op:.2f}",
                 }])
-                mostrar_tabla_ejecutiva(encabezado_programa)
+                encabezado_programa = st.data_editor(
+                    encabezado_programa.astype(str),
+                    hide_index=True,
+                    key=f"encabezado_{clave_programa}",
+                    alt="Editable working program header",
+                )
 
-                mostrar_tabla_ejecutiva(tabla_programa, resaltar_ultima=True)
+                tabla_programa = st.data_editor(
+                    tabla_programa,
+                    hide_index=True,
+                    key=f"programa_{clave_programa}",
+                    alt="Editable working program by crane",
+                )
 
                 tabla_turnos = construir_tabla_turnos_trabajados(df_cronograma)
-                cantidad_turnos = len(tabla_turnos)
                 col_turnos, col_gangs = st.columns([1, 3])
-                with col_turnos:
-                    mostrar_tabla_ejecutiva(pd.DataFrame({"Working Shifts": [cantidad_turnos]}))
                 with col_gangs:
-                    mostrar_tabla_ejecutiva(tabla_turnos)
+                    tabla_turnos = st.data_editor(
+                        tabla_turnos,
+                        column_config={
+                            "Gangs shifts": st.column_config.TextColumn(
+                                "Gangs shifts", default="TURNO X"
+                            ),
+                            "Gangs / STS / MHC": st.column_config.TextColumn(
+                                "Gangs / STS / MHC"
+                            ),
+                        },
+                        num_rows="dynamic",
+                        hide_index=True,
+                        key=f"tabla_turnos_{clave_programa}",
+                        alt="Editable table of working shifts and gangs",
+                    )
+                with col_turnos:
+                    mostrar_tabla_ejecutiva(
+                        pd.DataFrame({"Working Shifts": [len(tabla_turnos)]})
+                    )
 
                 st.markdown(
                     f"<div class='etc-banner'><span>ESTIMATED TIME OF COMPLETION</span>"
@@ -2125,10 +2331,14 @@ def render_simulador():
                 )
 
                 st.sidebar.divider()
+                nombre_buque_pdf = str(encabezado_programa["Vessel name"].iloc[0]) if len(encabezado_programa) else nombre_buque
                 st.sidebar.download_button(
                     "📄 Descargar reporte PDF",
-                    data=generar_reporte_pdf(df_cronograma, tabla_programa, nombre_buque),
-                    file_name=f"Reporte_Ejecutivo_{nombre_buque}.pdf",
+                    data=generar_reporte_pdf(
+                        df_cronograma, tabla_programa, nombre_buque_pdf,
+                        encabezado=encabezado_programa, tabla_turnos_editada=tabla_turnos,
+                    ),
+                    file_name=f"Reporte_Ejecutivo_{nombre_buque_pdf}.pdf",
                     mime="application/pdf",
                     use_container_width=True,
                 )

@@ -444,6 +444,18 @@ def validar_solucion(
     }
 
 
+def contar_traslados(df_cronograma):
+    """Desplazamientos entre bays distintos de cada grúa entre tareas consecutivas (partes del mismo bay no cuentan)."""
+    if df_cronograma.empty or "Bay Visual" not in df_cronograma:
+        return 0
+    df = df_cronograma.assign(_ini=pd.to_datetime(df_cronograma["Inicio"]), _bay=df_cronograma["Bay Visual"].map(_bay_numerico))
+    total = 0
+    for _, grupo in df.sort_values("_ini", kind="stable").groupby("Grúa"):
+        bays = [b for b in grupo["_bay"] if b is not None]
+        total += sum(1 for a, b in zip(bays, bays[1:]) if a != b)
+    return total
+
+
 def _evaluar_plan(df, cx, metodo):
     """Valida y puntúa un cronograma. `utilizable` = conserva movimientos, precedencias, pontones y fechas."""
     val = validar_solucion(
@@ -459,8 +471,10 @@ def _evaluar_plan(df, cx, metodo):
     reasignadas = int((df["Grúa"] != df["Grúa original"]).sum()) if "Grúa original" in df.columns else 0
     fragmentos = int(len(df) - df["Parent_Task_ID"].nunique())
     suma, desbalance = float(minutos.sum()), float(minutos.max() - minutos.min())
-    return {
+    traslados = contar_traslados(df)
+    ev = {
         "df": df, "metodo": metodo, "val": val, "factible": val["factible"],
+        "traslados": traslados, "ms_pen": float(val["makespan_min"]) + cx.get("penal", 0.0) * traslados,
         "utilizable": bool(
             val["movimientos_conservados"] and val["precedencias_validas"] and val["reglas_validas"]
             and val["pontones_validos"] and val["fechas_validas"]
@@ -470,6 +484,55 @@ def _evaluar_plan(df, cx, metodo):
         "reasignadas": reasignadas, "fragmentos": fragmentos, "desviacion": desviacion,
         "secundario": (suma, desbalance, fragmentos, reasignadas, desviacion),
     }
+    if ev["utilizable"] and ev["factible"]:
+        _registrar_alternativa(cx, ev)
+    return ev
+
+
+MAX_POOL_ALTERNATIVAS = 80
+
+
+def _firma_asignacion(df):
+    """Quién hace cada tarea y cuántos movimientos: dos planes con igual firma solo difieren en horarios."""
+    return frozenset(zip(df["Parent_Task_ID"], df["Grúa"], df["Movimientos"].astype(int)))
+
+
+def _registrar_alternativa(cx, ev):
+    pool = cx.setdefault("pool", {})
+    clave = (_firma_asignacion(ev["df"]), round(ev["ms"], 1))
+    if clave in pool:
+        return
+    pool[clave] = ev
+    if len(pool) > MAX_POOL_ALTERNATIVAS:
+        # Se descarta el plan que es peor tanto por makespan real como por makespan penalizado.
+        por_ms = {k: i for i, k in enumerate(sorted(pool, key=lambda k: pool[k]["ms"]))}
+        por_pen = {k: i for i, k in enumerate(sorted(pool, key=lambda k: pool[k]["ms_pen"]))}
+        del pool[max(pool, key=lambda k: min(por_ms[k], por_pen[k]))]
+
+
+def _resumen_alternativa(ev, **extra):
+    df = ev["df"].reset_index(drop=True).copy()
+    df.attrs = {}
+    return {
+        "df": df, "makespan_min": float(ev["ms"]), "reasignadas": ev["reasignadas"],
+        "fragmentos": ev["fragmentos"], "desbalance_min": ev["desbalance"],
+        "terminos_por_grua_min": ev["terminos"], "metodo": ev["metodo"],
+        "traslados": ev.get("traslados", contar_traslados(df)), "makespan_penalizado_min": ev.get("ms_pen"), **extra,
+    }
+
+
+def seleccionar_alternativas(evaluaciones, n=3, orden=None):
+    """Las `n` mejores planes con distinta asignación de grúas (se completa con variantes de horario)."""
+    orden = orden or (lambda ev: (ev["ms"], ev["secundario"]))
+    elegidas, firmas, resto = [], set(), []
+    for ev in sorted(evaluaciones, key=orden):
+        firma = _firma_asignacion(ev["df"])
+        if firma in firmas:
+            resto.append(ev)
+        else:
+            firmas.add(firma)
+            elegidas.append(ev)
+    return (elegidas + resto)[:n]
 
 
 def _comparar_planes(a, b):
@@ -769,12 +832,13 @@ def resolver_orden_fisico(df_cronograma, orden_fisico_gruas=None):
 
 def crear_contexto(
     semilla, config_gruas, intervalo_fn, holgura, rango, limite, permitir_reasignacion=True,
-    permitir_division=True, debug=False, t0=None,
+    permitir_division=True, debug=False, t0=None, penalizacion_traslado=0.0,
 ):
     """Contexto de optimización: la semilla (ya normalizada) como referencia y las reglas heredadas."""
     tareas = _tareas_desde_cronograma(semilla)
     aristas = construir_precedencias(tareas)
     return {
+        "penal": max(float(penalizacion_traslado), 0.0),
         "reasignar": bool(permitir_reasignacion), "dividir": bool(permitir_division),
         "inicios": {g: pd.Timestamp(config_gruas[g]["inicio"]) for g in semilla["Grúa"].unique()},
         "semilla": semilla, "tareas": tareas, "tareas_por_id": {t["id"]: t for t in tareas},
@@ -824,6 +888,44 @@ def resumen_cp_local(estadisticas):
     return estadisticas
 
 
+def _fase_penalizada(
+    cx, estrategias, mejor, penal, segundos, workers, semilla_aleatoria, reasignar, dividir,
+):
+    """Candidatas que desincentivan los traslados de bay; solo alimentan el pool de alternativas.
+
+    Cada candidata se valida con `_evaluar_plan` (que la registra) pero no se ofrece al incumbente, de modo
+    que la secuencia principal sigue siendo la de menor makespan real sin penalización.
+    """
+    limite = time.monotonic() + segundos
+    pendientes = [
+        (c, a, p) for p in (penal, 2 * penal) for _, c, a in estrategias
+    ] + [(c, None, p) for p in (penal, 2 * penal) for c in ("regret2",)]
+    for criterio, asignacion, p in pendientes:
+        if time.monotonic() > limite:
+            break
+        try:
+            df = _armar_cronograma(_despachar(
+                cx["tareas"], cx["config"], cx["intervalo_fn"], cx["holgura"], criterio, cx["rango"], asignacion,
+                limite=limite, aristas=cx["aristas"], permitir_reasignacion=reasignar,
+                permitir_division=dividir, penal_traslado=p,
+            ))
+            _evaluar_plan(df, cx, f"Despacho {criterio} con penalización de traslados")
+        except Exception as e:
+            _fallo(cx, f"fase penalizada: {criterio}", e)
+    restante = limite - time.monotonic()
+    if restante >= 1.0:
+        try:
+            df = _proponer_cpsat(
+                cx["semilla"], cx["config"], cx["intervalo_fn"], cx["holgura"], cx["rango"], restante, mejor["df"],
+                workers=workers, semilla_aleatoria=semilla_aleatoria, permitir_reasignacion=reasignar,
+                permitir_division=dividir, penal_traslado=penal,
+            )
+            if df is not None:
+                _evaluar_plan(df, cx, "CP-SAT con penalización de traslados")
+        except Exception as e:
+            _fallo(cx, "fase penalizada: CP-SAT", e)
+
+
 def proponer_secuencia(
     df_cronograma, config_gruas, intervalo_fn, holgura=15, tiempo_limite=TIEMPO_MAX_CPSAT,
     random_seed=42, workers=4, activar_reparacion_iterativa=True, activar_mejora_local=True,
@@ -831,6 +933,7 @@ def proponer_secuencia(
     usar_simulated_annealing=True, orden_fisico_gruas=None, debug=False,
     usar_cpsat_local=True, max_iteraciones_alns=None, activar_mejora_local_inicial=True,
     activar_intensificacion_final=True, presupuesto_fases=None, modo_reproducible=False,
+    penalizacion_traslado_min=5.0,
 ):
     """Propone una secuencia sin interferencias ni cruces de grúas, con libertad para rehacerla.
 
@@ -869,7 +972,7 @@ def proponer_secuencia(
     rango = resolver_orden_fisico(semilla, orden_fisico_gruas)
     cx = crear_contexto(
         semilla, config_gruas, intervalo_fn, holgura, rango, limite_total,
-        permitir_reasignacion, permitir_division, debug, t0,
+        permitir_reasignacion, permitir_division, debug, t0, penalizacion_traslado_min,
     )
     tareas, aristas = cx["tareas"], cx["aristas"]
     rnd = random.Random(random_seed)
@@ -989,6 +1092,11 @@ def proponer_secuencia(
         ms_fases["tras_intensificacion_final"] = inc.mejor["ms"]
         _snapshot()
 
+    if penalizacion_traslado_min > 0 and inc.mejor is not None and inc.mejor["factible"]:
+        _fase_penalizada(
+            cx, estrategias, inc.mejor, penalizacion_traslado_min, max(0.2 * total, 1.0),
+            workers, random_seed, permitir_reasignacion, permitir_division,
+        )
     mejor = inc.mejor
     for candidato in snapshots:
         if mejor is None or _comparar_planes(candidato, mejor)[0]:
@@ -1073,6 +1181,15 @@ def proponer_secuencia(
     )
     propuesta.attrs["mejora_desde_primera_factible_min"] = pf - ms_final if pf is not None else None
     propuesta.attrs["estado_solucion"] = estado_solucion(propuesta.attrs)
+    if mejor is not None and mejor["factible"]:
+        candidatas = [mejor] + [ev for ev in cx.get("pool", {}).values() if ev["df"] is not mejor["df"]]
+        propuesta.attrs["alternativas"] = [
+            _resumen_alternativa(ev) for ev in seleccionar_alternativas(
+                candidatas, 3, lambda ev: (ev is not mejor, ev["ms_pen"], ev["ms"], ev["secundario"]),
+            )
+        ]
+    else:
+        propuesta.attrs["alternativas"] = []
     return propuesta
 
 
@@ -1176,6 +1293,7 @@ def _despachar(
     tareas, config_gruas, intervalo_fn, holgura_min, criterio, rango, asignacion=None,
     piezas_previas=(), excluidas=None, forzadas=None, limite=None, aristas=None,
     permitir_reasignacion=True, permitir_division=True, huecos=False, prioridades=None, sin_dividir=(),
+    parciales=(), penal_traslado=0.0,
 ):
     """Despacho voraz de las tareas no congeladas; no modifica `tareas` ni `piezas_previas`.
 
@@ -1184,7 +1302,11 @@ def _despachar(
     Criterios: "inicio", "fin", "fin_sin_preferencia", "regret2" (primero la tarea con mayor
     pérdida si no se le da su mejor grúa) y "prioridad" (menor `prioridades[id]` primero).
     Con `huecos` las tareas pueden insertarse en huecos libres de la grúa, no solo al final.
-    `sin_dividir` son ids de tareas que no se parten. Retorna la lista completa de piezas.
+    `sin_dividir` son ids de tareas que no se parten. `parciales` son ids de tareas con piezas previas que
+    cubren solo parte de sus movimientos: el resto se despacha después de la última pieza fija.
+    Con `penal_traslado` (min ficticios) la grúa que debería cambiar de bay se considera esa cantidad de
+    minutos más tarde solo al elegir; los horarios reales no se alteran.
+    Retorna la lista completa de piezas.
     """
     margen = timedelta(minutes=holgura_min)
     gruas = sorted({t["grua"] for t in tareas})
@@ -1200,18 +1322,22 @@ def _despachar(
     }
     piezas = []
     fragmentos = defaultdict(int)
-    fin_tarea, completas = {}, set()
+    fin_tarea, completas, hechos = {}, set(), defaultdict(int)
     for pieza in sorted(piezas_previas, key=lambda p: (p["ini"], p["grua"])):
         piezas.append(pieza)
         _registrar_pieza(ctx, disponible, pieza)
         tid = pieza["tarea"]["id"]
         fin_tarea[tid] = max(fin_tarea.get(tid, pieza["fin"]), pieza["fin"])
-        completas.add(tid)
-        fragmentos[tid] = max(fragmentos[tid], 1)
+        hechos[tid] += pieza["movs"]
+        if tid in parciales:
+            fragmentos[tid] = max(fragmentos[tid], int(str(pieza["frag"]).rsplit(".", 1)[-1]) + 1)
+        else:
+            completas.add(tid)
+            fragmentos[tid] = max(fragmentos[tid], 1)
 
     pendientes = {t["id"]: t for t in tareas if t["id"] not in completas}
-    restante = {tid: t["movs"] for tid, t in pendientes.items()}
-    listo_propio = {}
+    restante = {tid: t["movs"] - (hechos[tid] if tid in parciales else 0) for tid, t in pendientes.items()}
+    listo_propio = {tid: fin_tarea[tid] for tid in pendientes if tid in parciales and tid in fin_tarea}
 
     while pendientes:
         if limite is not None and time.monotonic() > limite:
@@ -1243,6 +1369,10 @@ def _despachar(
                         continue
                     preferencia = 0 if (tarea["grua"] == grua or criterio == "fin_sin_preferencia") else 1
                     referencia = resultado[0] if criterio == "inicio" else resultado[1]
+                    bay_previo = ctx["posicion"][grua][0]
+                    if penal_traslado and bay_previo is not None and tarea["bay"] is not None \
+                            and bay_previo != tarea["bay"]:
+                        referencia = referencia + timedelta(minutes=penal_traslado)
                     prioridad = (referencia, preferencia, resultado[0], tarea["orig_ini"], tarea["orden"], grua)
                     if mejor_grua is None or prioridad < mejor_grua[0]:
                         mejor_grua = (prioridad, grua, vista, resultado)
@@ -1325,8 +1455,11 @@ def _pista_partes(partes, plan):
 def _proponer_cpsat(
     df_cronograma, config_gruas, intervalo_fn, holgura_min, rango, tiempo_max, pista=None,
     workers=4, semilla_aleatoria=42, permitir_reasignacion=True, permitir_division=True, info=None,
+    penal_traslado=0.0,
 ):
     """Optimiza con CP-SAT (OR-Tools) la asignación y el orden de tareas para minimizar el término.
+
+    Con `penal_traslado` (min ficticios) cada par (grúa, bay) usado suma esa penalización al objetivo.
 
     El modelo decide qué grúa hace cada parte de cada tarea y cuándo, con estas reglas:
     - Cada parte la hace una sola grúa y una grúa hace una cosa a la vez.
@@ -1451,7 +1584,19 @@ def _proponer_cpsat(
         modelo.Add(makespan >= E[i])
         for g, lit in X[i].items():
             modelo.Add(termino_grua[g] >= E[i]).OnlyEnforceIf(lit)
-    modelo.Minimize(100 * makespan + sum(termino_grua.values()))
+    objetivo = 100 * makespan + sum(termino_grua.values())
+    if penal_traslado > 0:
+        visita = {}
+        for i, p in enumerate(partes):
+            bay = p["tarea"]["bay"]
+            if bay is None:
+                continue
+            for g, lit in X[i].items():
+                if (g, bay) not in visita:
+                    visita[(g, bay)] = modelo.NewBoolVar(f"v{g}_{bay}")
+                modelo.AddImplication(lit, visita[(g, bay)])
+        objetivo = objetivo + int(round(100 * penal_traslado)) * sum(visita.values())
+    modelo.Minimize(objetivo)
 
     if pista is not None:
         for i, dato in enumerate(_pista_partes(partes, pista)):
@@ -1591,3 +1736,211 @@ def construir_colas_trabajo(df_propuesta):
             })
         colas[grua] = pd.DataFrame(filas)
     return colas
+
+
+# --- Mínimas cuadrillas en el último turno ---
+
+# Turnos de trabajo como (inicio, fin) desplazados desde la medianoche del día.
+TURNOS_TRABAJO = (
+    (timedelta(hours=8), timedelta(hours=15, minutes=30)),
+    (timedelta(hours=15, minutes=30), timedelta(hours=23)),
+    (timedelta(hours=23), timedelta(hours=30, minutes=30)),
+)
+CRITERIOS_MINIMAS_CUADRILLAS = ("fin", "fin_sin_preferencia", "inicio")
+
+
+def ventana_ultimo_turno(df_cronograma):
+    """(inicio, fin) del turno donde termina el cronograma; si termina entre turnos, hasta el término real."""
+    fin_max = pd.to_datetime(df_cronograma["Fin"]).max()
+    instante = fin_max - pd.Timedelta(seconds=1)
+    base = pd.Timestamp(instante.date())
+    ventanas = sorted(
+        (base + timedelta(days=d) + a, base + timedelta(days=d) + b)
+        for d in (-1, 0, 1) for a, b in TURNOS_TRABAJO
+    )
+    for ini, fin in ventanas:
+        if ini <= instante < fin:
+            return ini, fin
+    ini, fin = [v for v in ventanas if v[0] <= instante][-1]
+    return ini, max(fin, fin_max)
+
+
+def gruas_en_ventana(df_cronograma, ventana):
+    """Grúas con alguna tarea que se solapa con la ventana (mismo criterio que el reporte por turno)."""
+    ini, fin = ventana
+    solapa = (pd.to_datetime(df_cronograma["Inicio"]) < fin) & (pd.to_datetime(df_cronograma["Fin"]) > ini)
+    return sorted(df_cronograma.loc[solapa, "Grúa"].astype(str).unique())
+
+
+def _congelar_para_subconjunto(piezas, cx, inicio_ventana, permitidas):
+    """Piezas que se conservan al fijar las grúas del último turno, cortando la cola en `inicio_ventana`.
+
+    Se conserva todo lo que termina antes de la ventana. La tarea que una grúa que sale tiene en curso en
+    el corte se trunca: se queda con los movimientos que alcanza a hacer y el resto (tarea parcial) pasa a
+    las grúas que continúan. Lo que empieza dentro de la ventana se rehace. Devuelve (piezas, parciales).
+    """
+    por_tarea = defaultdict(list)
+    for p in sorted(piezas, key=lambda p: p["ini"]):
+        por_tarea[p["tarea"]["id"]].append(p)
+    kept = {}
+    for tid, ps in por_tarea.items():
+        conservadas = []
+        for p in ps:
+            if p["fin"] <= inicio_ventana:
+                conservadas.append(p)
+            elif p["ini"] >= inicio_ventana:
+                continue
+            elif p["grua"] in permitidas or p["tarea"]["dur_fija"] is not None:
+                conservadas.append(p)
+            else:
+                params = cx["config"][p["grua"]]
+                movs = _max_movs_hasta(params, p["ini"].to_pydatetime(), inicio_ventana.to_pydatetime(),
+                                       p["movs"], cx["intervalo_fn"])
+                if movs > 0:
+                    _, fin, dur = cx["intervalo_fn"](params, p["ini"].to_pydatetime(), movs, None)
+                    conservadas.append({**p, "movs": movs, "fin": pd.Timestamp(fin), "dur": dur})
+        if conservadas:
+            kept[tid] = conservadas
+
+    def completa(tid):
+        t = cx["tareas_por_id"][tid]
+        ps = kept.get(tid)
+        return bool(ps) and (t["dur_fija"] is not None or sum(p["movs"] for p in ps) >= t["movs"])
+
+    cambio = True
+    while cambio:
+        cambio = False
+        for tid in list(kept):
+            if any(not completa(p) for p in cx["preds"].get(tid, ())):
+                del kept[tid]
+                cambio = True
+    parciales = {tid for tid in kept if not completa(tid)}
+    return [p for ps in kept.values() for p in ps], parciales
+
+
+def _intentar_subconjunto(cx, piezas_base, ventana, permitidas, limite):
+    """Mejor cronograma factible que usa solo `permitidas` en la ventana; None si no hay ninguno."""
+    inicio_v, fin_v = ventana
+    descartadas = set(cx["gruas"]) - set(permitidas)
+    congeladas, parciales = _congelar_para_subconjunto(piezas_base, cx, inicio_v, permitidas)
+    ids_fijos = {p["tarea"]["id"] for p in congeladas} - parciales
+    excluidas = {t["id"]: descartadas for t in cx["tareas"] if t["id"] not in ids_fijos}
+    mejor = None
+    penalizaciones = [0.0] + ([cx["penal"], 2 * cx["penal"]] if cx["penal"] > 0 else [])
+    for penal, criterio in [(p, c) for p in penalizaciones for c in CRITERIOS_MINIMAS_CUADRILLAS]:
+        if time.monotonic() > limite:
+            break
+        try:
+            df = _armar_cronograma(_despachar(
+                cx["tareas"], cx["config"], cx["intervalo_fn"], cx["holgura"], criterio, cx["rango"],
+                piezas_previas=congeladas, excluidas=excluidas, limite=limite, aristas=cx["aristas"],
+                permitir_reasignacion=True, permitir_division=True, parciales=parciales, penal_traslado=penal,
+            ))
+            ev = _evaluar_plan(df, cx, f"Mínimas cuadrillas ({criterio})")
+        except Exception:
+            continue
+        if not (ev["utilizable"] and ev["factible"]):
+            continue
+        if pd.to_datetime(df["Fin"]).max() > fin_v + pd.Timedelta(seconds=1):
+            continue
+        if len(gruas_en_ventana(df, ventana)) > len(permitidas):
+            continue
+        cx.setdefault("validas_mc", []).append((tuple(permitidas), ev))
+        if penal == 0 and (mejor is None or ev["ms"] < mejor["ms"]):
+            mejor = ev
+    return mejor
+
+
+def proponer_minimas_cuadrillas(
+    df_semilla, df_base, config_gruas, intervalo_fn, holgura=15, tipo_fn=None, tiempo_limite=20,
+    orden_fisico_gruas=None, penalizacion_traslado_min=5.0,
+): 
+    """Reduce las grúas con trabajo en el último turno sin sacar el término de ese turno.
+
+    `df_base` es la secuencia de mínimo makespan (o la semilla si ya es factible), generada a partir de
+    `df_semilla`. Se prueban subconjuntos de grúas para el último turno, de menor a mayor tamaño y, a igual
+    tamaño, con más STS primero (`tipo_fn(nombre) -> "STS"|"MHC"|...`). La cola de cada grúa que sale se
+    corta en el inicio del turno: la tarea en curso se parte y sus movimientos restantes pasan a las grúas
+    que continúan (siempre se permite dividir). Lo demás se rehace con el despachador, respetando
+    precedencias, orden físico y separación de bays.
+    Devuelve la base sin cambios si no se puede ahorrar ninguna cuadrilla. Metadatos en `attrs`.
+    """
+    t0 = time.monotonic()
+    limite = t0 + max(float(tiempo_limite), 0.5)
+    semilla = _asegurar_identidad(df_semilla)
+    if "Grúa original" not in semilla.columns:
+        semilla["Grúa original"] = semilla["Grúa"]
+    base = df_base.reset_index(drop=True).copy()
+    if not all(c in base.columns for c in COLUMNAS_IDENTIDAD):
+        base = semilla.copy()
+    base.attrs = {}
+    rango = resolver_orden_fisico(semilla, orden_fisico_gruas)
+    cx = crear_contexto(
+        semilla, config_gruas, intervalo_fn, holgura, rango, limite, True, True, False, t0,
+        penalizacion_traslado_min,
+    )
+    tipo = tipo_fn or (lambda g: "Otra")
+    ventana = ventana_ultimo_turno(base)
+    activas = gruas_en_ventana(base, ventana)
+    piezas_base = _piezas_desde_df(base, cx)
+    gmph = {g: float(config_gruas[g].get("gmph", 0)) for g in cx["gruas"]}
+
+    elegido, mejor_clave = None, None
+    for tam in range(1, len(activas)):
+        subconjuntos = sorted(
+            itertools.combinations(cx["gruas"], tam),
+            key=lambda s: (-sum(tipo(g) == "STS" for g in s), -sum(gmph[g] for g in s), s),
+        )
+        for sub in subconjuntos:
+            clave_sts = -sum(tipo(g) == "STS" for g in sub)
+            if time.monotonic() > limite:
+                break
+            ev = _intentar_subconjunto(cx, piezas_base, ventana, sub, limite)
+            if ev is None:
+                continue
+            clave = (clave_sts, ev["ms"])
+            if elegido is None or clave < mejor_clave:
+                elegido, mejor_clave = (ev, sub), clave
+        if elegido is not None or time.monotonic() > limite:
+            break
+
+    if elegido is not None:
+        propuesta = elegido[0]["df"].reset_index(drop=True).copy()
+        propuesta.attrs["metodo"] = "Mínimas cuadrillas en el último turno"
+        propuesta.attrs["subconjunto"] = list(elegido[1])
+    else:
+        propuesta = base.copy()
+        propuesta.attrs["metodo"] = "Sin ahorro posible (se mantiene la secuencia base)"
+        propuesta.attrs["subconjunto"] = list(activas)
+    en_ventana = gruas_en_ventana(propuesta, ventana)
+    if elegido is not None:
+        tam_ok = len(elegido[1])
+        clave_de = {id(ev): sub for sub, ev in cx.get("validas_mc", [])}
+        validas = [ev for sub, ev in cx.get("validas_mc", []) if len(sub) == tam_ok]
+        orden_mc = lambda ev: (  # noqa: E731
+            ev["df"] is not elegido[0]["df"], -sum(tipo(g) == "STS" for g in clave_de[id(ev)]), ev["ms_pen"],
+            ev["ms"], ev["secundario"],
+        )
+        alternativas = [
+            _resumen_alternativa(ev, subconjunto=list(clave_de[id(ev)]))
+            for ev in seleccionar_alternativas(validas, 3, orden_mc)
+        ]
+    else:
+        alternativas = [_resumen_alternativa(
+            {"df": base, "ms": calcular_makespan_min(base), "reasignadas": 0, "fragmentos": 0,
+             "desbalance": 0.0, "terminos": {}, "metodo": propuesta.attrs["metodo"],
+             "traslados": contar_traslados(base)},
+            subconjunto=list(activas),
+        )]
+    propuesta.attrs.update({
+        "alternativas": alternativas,
+        "ventana_turno": ventana,
+        "gruas_turno_base": activas,
+        "gruas_turno_final": en_ventana,
+        "cuadrillas_ahorradas": len(activas) - len(en_ventana),
+        "makespan_base_min": calcular_makespan_min(base),
+        "makespan_final_min": calcular_makespan_min(propuesta),
+        "tiempo_total_seg": round(time.monotonic() - t0, 2),
+        "tiempo_agotado": time.monotonic() > limite,
+    })
+    return propuesta
